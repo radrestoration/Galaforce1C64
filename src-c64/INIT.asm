@@ -90,74 +90,87 @@ exec:
     sta $D021             ; background black
 
     jsr clear_screen
-
-    ; --- Title: GALAFORCE, 3x2 cells/letter (double width, double height -
-    ; see blit_title_char), red, rows 4-5. 9 letters x 3 cells = 27 cells;
-    ; (40-27)/2 = 6 start col, centering it same as before. col*8 (max
-    ; 30*8=240) still fits in one byte, and since $6500's low byte is 0,
-    ; adding col*8 to it never carries - temp3's high byte stays $65. ---
-    ldx #0
-draw_title_loop:
-    txa
-    sta length            ; length = index (temporary)
-    asl a                 ; A = index*2
-    clc
-    adc length             ; A = index*2 + index = index*3
-    clc
-    adc #6                  ; A = index*3 + 6
-    sta length               ; length = col
-    lda length
-    asl a
-    asl a
-    asl a
-    sta temp3              ; low byte = col*8
-    lda #$65
-    sta temp3+1
-    lda length
-    clc
-    adc #<($4000+4*40)
-    sta temp4
-    lda #>($4000+4*40)
-    adc #0
-    sta temp4+1
-    lda colour_title
-    sta colour
-    txa
-    pha                    ; blit_title_char uses X as scratch - preserve
-    lda title_letter_codes,x  ; our loop index across the call (X unchanged
-    jsr blit_title_char        ; by txa/pha above, so ,x addressing here
-    pla                          ; still uses the right index)
-    tax
-    inx
-    cpx #9
-    bne draw_title_loop
-
-    jsr draw_score_bar
-    jsr draw_body_text
-
-    jsr draw_level_flags
-
+    jsr draw_title_screen
     jsr star_init
 
-; --- Title screen: stars animate, wait for SPACE or RETURN to start. One
-; raster-poll per frame (line 250 - below the visible 200 lines, so a
-; single 8-bit compare against $D012 is enough). ---
+; --- Title / high-score / demo cycle: matches INIT.asm's wait_for_space/
+; hsclp/into_demo - title waits up to 256 frames for SPACE or RETURN; on
+; timeout, shows the high-score table and waits up to 256 MORE frames; on
+; a second timeout, starts the demo. A keypress during either wait starts
+; a normal game. Frame counting uses the same "INC, BNE loops, falls
+; through on wraparound" trick the BBC source uses (counter is a byte;
+; BEQ after 256 increments is a natural wraparound check, no separate
+; compare needed) - see title_frame_count. One raster-poll per frame
+; (line 250 - below the visible 200 lines, so a single 8-bit compare
+; against $D012 is enough) throughout. ---
 title_wait_loop:
+    lda #0
+    sta title_frame_count
+twl_loop:
     lda #250
 twl_wait_raster:
     cmp $D012
     bne twl_wait_raster
     jsr movestars
+    jsr refresh_music
     jsr check_start_key
-    bne title_wait_loop
+    beq game_start
+    inc title_frame_count
+    bne twl_loop
 
-; --- Game start: wipe the title text, fresh stars, drop the ship in at
-; its start column, and redraw the score bar / level flags / lives icon
-; on the now-blank game screen (clear_screen wiped them along with
-; everything else). ---
+; --- High scores: same idle-timeout structure as the title wait above,
+; on its own fresh screen (own star field too, matching srlp/movestars
+; being called throughout the BBC's hsclp loop, not just the title). ---
+show_high_scores:
+    jsr clear_screen
+    jsr draw_high_score_table
+    jsr draw_score_bar
+    jsr draw_ks_indicator
+    jsr draw_level_flags
+    jsr draw_lives_icons
+    jsr star_init
+    lda #0
+    sta title_frame_count
+hs_loop:
+    lda #250
+hs_wait_raster:
+    cmp $D012
+    bne hs_wait_raster
+    jsr movestars
+    jsr refresh_music
+    jsr check_start_key
+    beq game_start
+    inc title_frame_count
+    bne hs_loop
+
+; --- Demo: real simulated-input gameplay is a later phase (nothing
+; drives movement/firing on its own yet - process_demo, ROUT3.asm's
+; equivalent, is still a stub). For now this just marks demo_flag (so
+; that stub has something real to check once it exists) and cycles back
+; to the title, which at least makes the full title -> high scores ->
+; timeout loop observable end to end before demo gameplay exists to fill
+; it. into_demo's real starting-wave logic (rand() AND 7) belongs here
+; once there's a wave system for it to select from.
+start_demo:
+    lda #1
+    sta demo_flag
+    jsr clear_screen
+    jsr draw_title_screen
+    jsr star_init
+    jmp title_wait_loop
+
+; --- Game start: wipe the screen, fresh stars, drop the ship in at its
+; start column, and draw the score bar / level flags / lives icon on the
+; now-blank game screen (clear_screen wiped them along with everything
+; else). Reached either by a keypress during the title or high-score
+; wait above. ---
+game_start:
+    lda #0
+    sta demo_flag
     jsr clear_screen
     jsr star_init
     jsr draw_score_bar
+    jsr draw_ks_indicator
     jsr draw_level_flags
     jsr draw_lives_icons
     jsr draw_alien
@@ -183,16 +196,40 @@ gs_return_held:
 gs_store_fire_prev:
     sta fire_key_prev
 
+    lda #0                  ; tune 0 - placeholder until real tune data exists
+    jsr start_tune
+
+title_frame_count:
+ .byte 0
+
 game_loop:
     lda #250
 gl_wait_raster:
     cmp $D012
     bne gl_wait_raster
     jsr movestars
+    jsr refresh_music
+    jsr check_escape_key
+    beq game_loop_escape
     jsr handle_ship_input
     jsr fire_bullet_if_requested
     jsr move_bullets
+    jsr move_alien_bullets
     jmp game_loop
+game_loop_escape:
+    jmp title_wait_loop
+
+; check_escape_key: RUN/STOP, checked each frame in game_loop to bail
+; back to the title - a TEMPORARY stand-in (you flagged the real key as
+; probably different, TBD) for whatever quits play on the real hardware.
+; Returns with the Z flag set (BEQ taken by the caller) if held, same
+; convention as check_start_key.
+check_escape_key:
+    lda #$7F               ; clear bit7: select column 7 (same column as SPACE)
+    sta $DC00
+    lda $DC01
+    and #$80                 ; row bit 7 = RUN/STOP
+    rts
 
 ; check_start_key: returns with the Z flag set (BEQ taken by the caller)
 ; if SPACE or RETURN is currently held, clear otherwise. See the C64
@@ -264,12 +301,21 @@ hsi_check_x:
     inc ship_col
     jsr draw_ship
 
+; "Up" accepts either of two keys, both in C64 keyboard column 6:
+; ";" (bit2) - the physically correct key on a real C64 keyboard, and
+; "=" (bit5) - where VICE's default keymap tends to land a host
+; apostrophe press, going by physical keyboard position (right of ";"
+; on both a PC and a C64 keyboard).
 hsi_check_up:
-    lda #$DF               ; clear bit5: select column 5 (":"'s column)
+    lda #$BF               ; clear bit6: select column 6 (";" and "="'s column)
     sta $DC00
     lda $DC01
-    and #$20                  ; row bit 5 = ":"
+    and #$04                  ; row bit 2 = ";"
+    beq hsi_up_pressed
+    lda $DC01
+    and #$20                  ; row bit 5 = "="
     bne hsi_check_down
+hsi_up_pressed:
     lda ship_row
     cmp #SHIP_MIN_ROW
     beq hsi_check_down
@@ -325,12 +371,13 @@ ship_move_count:
 ; pixel is real background (black), not a substituted color, so it's
 ; just left as background, no pixel drawn there at all.
 ;
-; A small pool (BULLET_COUNT) replaces the old single-bullet-in-flight
-; limit. Movement is a full cell-row per tick (matching BOMBS1.asm's own
-; "SBC #8" - it moves 8 BBC scanlines, i.e. one row, per game frame too),
-; which is simple: no sub-cell/cell-boundary bookkeeping needed at all,
-; just a plain row counter and compute_bullet_addr's row*40+col*8 math.
-BULLET_COUNT = 4
+; Pool size matches CONST.asm's mymaxbull (3), not an arbitrary "a few" -
+; that's the real BBC cap on simultaneous player bullets. Movement is a
+; full cell-row per tick (matching BOMBS1.asm's own "SBC #8" - it moves
+; 8 BBC scanlines, i.e. one row, per game frame too), which is simple:
+; no sub-cell/cell-boundary bookkeeping needed at all, just a plain row
+; counter and compute_bullet_addr's row*40+col*8 math.
+BULLET_COUNT = 3
 
 bullet_bitmap:
  .byte $30,$30,$30,$30,$30,$30,$fc,$20
@@ -457,20 +504,23 @@ fbr_row_set:
     adc #1                   ; middle of the ship's 3 cells
     sta bullet_col,x
     jsr draw_bullet_x
+    lda #0                  ; sound 0 - placeholder until real effect data exists
+    jsr mk_sound
 fbr_done:
     rts
 
 ; move_bullets: advances every active bullet one cell-row up per call,
 ; deactivating instead of wrapping once it passes row 0 (compare
-; movestars, which respawns - bullets just vanish off the top).
-; Throttled the same way as movestars/handle_ship_input - a full cell-
-; row a frame was too fast to actually look at. This slowdown is a
-; temporary look-at-it aid, not a final gameplay speed - revisit once
-; real play-balance is being tuned. Colors (currently substituted white
-; -> magenta, red -> cyan, per the 3-non-black-per-cell budget - see the
-; bullet_bitmap note above) are also accepted "for now", not final -
-; revisit those too when picking the game's real palette.
-BULLET_MOVE_SLOWDOWN = 8
+; movestars, which respawns - bullets just vanish off the top). BBC
+; moves bullets a full row EVERY frame, untouched - our own throttle
+; was slowing that down 8x just to make it easier to eyeball; brought
+; down to a still-visible-but-real 3x instead of the untouched 1x since
+; there's nothing on screen to shoot at yet to judge full speed against
+; (revisit once aliens exist - phase 5). Colors (currently substituted
+; white -> magenta, red -> cyan, per the 3-non-black-per-cell budget -
+; see the bullet_bitmap note above) are also accepted "for now", not
+; final - revisit those too when picking the game's real palette.
+BULLET_MOVE_SLOWDOWN = 3
 bullet_move_count:
  .byte 0
 
@@ -500,6 +550,126 @@ mbs_next:
     cpx #BULLET_COUNT
     bne mbs_loop
 mbs_rts:
+    rts
+
+; --- Alien bullets: a second, separate pool sized to CONST.asm's
+; almaxbull (6), mirroring the player pool above but moving down instead
+; of up. Nothing spawns into this yet - aliens don't fire until they
+; exist (see the plan's phase 5) - but the pool, draw and move mechanics
+; are built now so alien work doesn't have to bolt bullets on afterward.
+; move_alien_bullets is already called from game_loop; with every slot
+; inactive it's just a cheap no-op pass over 6 flags.
+;
+; The graphic below is a PLACEHOLDER, not a decode: BOMBS2.asm's real
+; alien bomb (.albomb, 10 bytes) is plotted through xycalc2 at an
+; arbitrary (non cell-aligned) pixel row, and its last 2 bytes land in
+; the scanlines of the NEXT cell down - properly decoding that needs
+; xycalc2's addressing worked out first, which isn't needed until
+; something actually fires one of these. Reusing the player bullet's
+; shape here is an explicit stand-in, not a guess at the real graphic.
+ALIEN_BULLET_COUNT = 6
+
+alien_bullet_active:
+ .res ALIEN_BULLET_COUNT
+alien_bullet_row:
+ .res ALIEN_BULLET_COUNT
+alien_bullet_col:
+ .res ALIEN_BULLET_COUNT
+
+; compute_alien_bullet_addr: X = alien-bullet slot index. Same row*40+
+; col*8 math as compute_bullet_addr, kept as its own copy rather than
+; parameterized - 6502 has no cheap way to pass "which array" into a
+; shared routine without self-modifying code, same tradeoff already
+; noted for draw_score_bar/draw_body_text's table loops.
+compute_alien_bullet_addr:
+    lda #0
+    sta temp3
+    sta temp3+1
+    lda alien_bullet_row,x
+    beq caba_row_done
+    sta length
+caba_row_loop:
+    lda temp3
+    clc
+    adc #40
+    sta temp3
+    lda temp3+1
+    adc #0
+    sta temp3+1
+    dec length
+    bne caba_row_loop
+caba_row_done:
+    lda temp3
+    clc
+    adc alien_bullet_col,x
+    sta temp3
+    lda temp3+1
+    adc #0
+    sta temp3+1
+    asl temp3
+    rol temp3+1
+    asl temp3
+    rol temp3+1
+    asl temp3
+    rol temp3+1
+    lda temp3
+    clc
+    adc #<$6000
+    sta temp3
+    lda temp3+1
+    adc #>$6000
+    sta temp3+1
+    rts
+
+; draw_alien_bullet_x: X = alien-bullet slot index. XOR-plots the
+; placeholder shape at that slot's current cell - also its own erase,
+; same as draw_bullet_x. Preserves X.
+draw_alien_bullet_x:
+    jsr compute_alien_bullet_addr
+    ldy #0
+dabx_loop:
+    lda bullet_bitmap,y
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    cpy #8
+    bne dabx_loop
+    rts
+
+; move_alien_bullets: mirrors move_bullets, downward - advances every
+; active alien bullet one cell-row per call, deactivating past row 24
+; (the last row) instead of wrapping.
+ALIEN_BULLET_MOVE_SLOWDOWN = 3
+alien_bullet_move_count:
+ .byte 0
+
+move_alien_bullets:
+    inc alien_bullet_move_count
+    lda alien_bullet_move_count
+    cmp #ALIEN_BULLET_MOVE_SLOWDOWN
+    bcc mabs_rts
+    lda #0
+    sta alien_bullet_move_count
+
+    ldx #0
+mabs_loop:
+    lda alien_bullet_active,x
+    beq mabs_next
+    jsr draw_alien_bullet_x    ; erase at the current position
+    lda alien_bullet_row,x
+    cmp #24
+    beq mabs_deactivate
+    inc alien_bullet_row,x
+    jsr draw_alien_bullet_x    ; redraw at the new position
+    jmp mabs_next
+mabs_deactivate:
+    lda #0
+    sta alien_bullet_active,x
+mabs_next:
+    inx
+    cpx #ALIEN_BULLET_COUNT
+    bne mabs_loop
+mabs_rts:
     rts
 
 ; --- Alien (test render, fixed position - "let's put an alien on the
@@ -878,6 +1048,36 @@ clear_colorram_byte:
 process_demo:
     rts
 
+; --- Music/sound skeleton: no SID programming yet, just the call sites
+; wired to the same logical events the BBC triggers sound from, so real
+; playback later is a drop-in rather than another hunt through the game
+; loop. BBC call sites traced directly: StartTune (INIT.asm/ALIENS1.asm/
+; ROUT4.asm - wave start, demo message-loop refresh, game-over jingle),
+; MusicTest (same files - "has the tune finished" check driving those
+; loops' timing), Refresh (INIT.asm's dem_sound - periodic music-engine
+; tick), mksound (INIT.asm/ROUT2.asm/ROUT3.asm/BOMBS1.asm - one-off sound
+; effects like firing/crashing, called with a pointer to effect data).
+;
+; start_tune/mk_sound take a 0-based ID in A - not a data pointer like
+; BBC's versions, since we don't have real tune/effect tables yet; the ID
+; is just reserved so call sites don't need to change again once we do.
+; music_test's intended contract (once real) is the same as BBC's: return
+; with the Z flag clear (BNE taken by the caller) while a tune is still
+; playing. Not called yet - nothing in the game loop needs to wait on
+; music finishing until the high-score/demo cycle (later phases) does.
+
+start_tune:
+    rts
+
+refresh_music:
+    rts
+
+mk_sound:
+    rts
+
+music_test:
+    rts
+
 ; --- Level-number flags, bottom-left corner (rows 23-24) - NOT a lives
 ; display (that's the separate icon below, bottom-right): FLAGS.asm's
 ; flagson draws this from `temp` = curwave+1, i.e. the wave/level number,
@@ -1183,6 +1383,62 @@ dol_right:
     sta (temp2),y
     rts
 
+; draw_title_screen: the full title screen's text content (GALAFORCE
+; letters, score bar, body text, KS indicator, level flags) - NOT stars
+; (star_init is a separate call at each use site, since the high-score
+; cycle re-inits stars fresh too rather than carrying the title's over)
+; and NOT clear_screen (callers clear first). Factored out of exec so
+; the title-wait/high-score/demo cycle (see title_wait_loop) can redraw
+; the title after cycling back from the high-score screen, not just once
+; at boot.
+draw_title_screen:
+    ; GALAFORCE, 3x2 cells/letter (double width, double height - see
+    ; blit_title_char), red, rows 4-5. 9 letters x 3 cells = 27 cells;
+    ; (40-27)/2 = 6 start col, centering it same as before. col*8 (max
+    ; 30*8=240) still fits in one byte, and since $6500's low byte is 0,
+    ; adding col*8 to it never carries - temp3's high byte stays $65.
+    ldx #0
+draw_title_loop:
+    txa
+    sta length            ; length = index (temporary)
+    asl a                 ; A = index*2
+    clc
+    adc length             ; A = index*2 + index = index*3
+    clc
+    adc #6                  ; A = index*3 + 6
+    sta length               ; length = col
+    lda length
+    asl a
+    asl a
+    asl a
+    sta temp3              ; low byte = col*8
+    lda #$65
+    sta temp3+1
+    lda length
+    clc
+    adc #<($4000+4*40)
+    sta temp4
+    lda #>($4000+4*40)
+    adc #0
+    sta temp4+1
+    lda colour_title
+    sta colour
+    txa
+    pha                    ; blit_title_char uses X as scratch - preserve
+    lda title_letter_codes,x  ; our loop index across the call (X unchanged
+    jsr blit_title_char        ; by txa/pha above, so ,x addressing here
+    pla                          ; still uses the right index)
+    tax
+    inx
+    cpx #9
+    bne draw_title_loop
+
+    jsr draw_score_bar
+    jsr draw_body_text
+    jsr draw_ks_indicator
+    jsr draw_level_flags
+    rts
+
 ; --- Score bar / body text: both just a list of (string, position,
 ; color) to print with print_bitmap_line, so both are driven off a
 ; small table instead of repeating the same 8-line "set 4 registers,
@@ -1231,14 +1487,6 @@ dsb_loop:
     bne dsb_loop
     rts
 
-; K and S are two separate table entries (two separate strings), not one
-; "KS" string, so they can have different colors: with the tight sub-
-; cell spacing, letters within ONE string can share a cell (see
-; print_bitmap_line), which would force them to the same color. Drawing
-; them separately, each starting fresh at color-pixel offset 0, keeps
-; their own spacing unchanged - S just starts 2 cells after K (K's own
-; span), the minimum gap that avoids sharing a cell, not extra space
-; added.
 draw_body_text:
     ldx #0
 dbt_loop:
@@ -1263,9 +1511,95 @@ dbt_loop:
     clc
     adc #7
     tax
-    cpx #(6*7)
+    cpx #(4*7)
     bne dbt_loop
     rts
+
+; draw_ks_indicator: the "K"/"S" key-or-joystick hint, title screen AND
+; gameplay (BBC shows it during play too - see display_key_joy_status).
+; K and S are two separate table entries (two separate strings), not one
+; "KS" string, so they can have different colors: with the tight sub-
+; cell spacing, letters within ONE string can share a cell (see
+; print_bitmap_line), which would force them to the same color. Drawing
+; them separately, each starting fresh at color-pixel offset 0, keeps
+; their own spacing unchanged - S just starts 2 cells after K (K's own
+; span), the minimum gap that avoids sharing a cell, not extra space
+; added.
+draw_ks_indicator:
+    ldx #0
+dks_loop:
+    lda ks_table,x
+    sta temp2
+    lda ks_table+1,x
+    sta temp2+1
+    lda ks_table+2,x
+    sta temp3
+    lda ks_table+3,x
+    sta temp3+1
+    lda ks_table+4,x
+    sta temp4
+    lda ks_table+5,x
+    sta temp4+1
+    lda ks_table+6,x
+    sta colour
+    stx dtt_saved_x
+    jsr print_bitmap_line
+    ldx dtt_saved_x
+    txa
+    clc
+    adc #7
+    tax
+    cpx #(2*7)
+    bne dks_loop
+    rts
+
+; draw_high_score_table: the placeholder table (see str_hs_title/str_hs1-5
+; above) - callers clear_screen first, same convention as draw_title_screen.
+draw_high_score_table:
+    ldx #0
+dhs_loop:
+    lda high_score_table,x
+    sta temp2
+    lda high_score_table+1,x
+    sta temp2+1
+    lda high_score_table+2,x
+    sta temp3
+    lda high_score_table+3,x
+    sta temp3+1
+    lda high_score_table+4,x
+    sta temp4
+    lda high_score_table+5,x
+    sta temp4+1
+    lda high_score_table+6,x
+    sta colour
+    stx dtt_saved_x
+    jsr print_bitmap_line
+    ldx dtt_saved_x
+    txa
+    clc
+    adc #7
+    tax
+    cpx #(6*7)
+    bne dhs_loop
+    rts
+
+; Positions below (rows 6/9/11/13/15/17, cols 12-14) are a first guess,
+; not measured against anything - confirmed needing adjustment once
+; there's a look at it alongside the score bar/flags/lives it now shares
+; the screen with.
+high_score_table:
+    .word str_hs_title, $6000+(6*40+14)*8,  $4000+6*40+14
+    .byte 7                                              ; yellow
+    .word str_hs1,       $6000+(9*40+12)*8,  $4000+9*40+12
+    .byte 3                                              ; cyan
+    .word str_hs2,       $6000+(11*40+12)*8, $4000+11*40+12
+    .byte 3
+    .word str_hs3,       $6000+(13*40+12)*8, $4000+13*40+12
+    .byte 3
+    .word str_hs4,       $6000+(15*40+12)*8, $4000+15*40+12
+    .byte 3
+    .word str_hs5,       $6000+(17*40+12)*8, $4000+17*40+12
+    .byte 3
 
 score_bar_table:
     .word str_scr,      $6000+3*8,          $4000+3
@@ -1286,6 +1620,8 @@ body_text_table:
     .byte 5
     .word str_superior, $6000+(21*40+7)*8,  $4000+21*40+7
     .byte 4                                              ; magenta
+
+ks_table:
     .word str_k,        $6000+(24*40+35)*8, $4000+24*40+35
     .byte 3                                              ; cyan
     .word str_s,        $6000+(24*40+37)*8, $4000+24*40+37
@@ -1655,6 +1991,24 @@ str_k:
     .byte 21,$FF                                    ; K
 str_s:
     .byte 29,$FF                                    ; S
+
+; Placeholder high-score table text - HIGH.asm's real one (hsnum/hstxt,
+; up to 10-char names + 7-digit scores, ahigh/pht) reads and writes
+; persistent score data we don't have yet ("no persistent storage yet -
+; separate concern" per the demo-mode plan). These are fixed strings
+; standing in for that until scoring itself exists.
+str_hs_title:
+    .byte 18,19,17,18,0,29,13,25,28,15,29,$FF        ; HIGH SCORES
+str_hs1:
+    .byte 2,0,21,15,32,0,2,1,1,1,1,1,$FF              ; 1 KEV 100000
+str_hs2:
+    .byte 3,0,29,31,26,0,1,9,1,1,1,1,$FF              ; 2 SUP 080000
+str_hs3:
+    .byte 4,0,13,7,5,0,1,7,1,1,1,1,$FF                ; 3 C64 060000
+str_hs4:
+    .byte 5,0,11,11,11,0,1,5,1,1,1,1,$FF              ; 4 AAA 040000
+str_hs5:
+    .byte 6,0,12,12,12,0,1,3,1,1,1,1,$FF              ; 5 BBB 020000
 
 ; LEFT_TABLE/RIGHT_TABLE: indexed by a source glyph row's top 5 bits (its
 ; 5 real pixel columns, srcbyte>>3, giving an index 0-31), giving the
