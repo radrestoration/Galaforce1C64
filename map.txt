@@ -1,0 +1,61 @@
+Modules list:
+-------------
+Master-c64.mak.o:
+    CODE              Offs=000000  Size=002759  Align=00001  Fill=0000
+    RODATA            Offs=000000  Size=0008EE  Align=00001  Fill=0000
+    DATA              Offs=000000  Size=0002D5  Align=00001  Fill=0000
+    ZEROPAGE          Offs=000000  Size=00005D  Align=00001  Fill=0000
+    ZP2               Offs=000000  Size=000005  Align=00001  Fill=0000
+/home/peter/x16/cc65/lib/c64.lib(exehdr.o):
+    EXEHDR            Offs=000000  Size=00000C  Align=00001  Fill=0000
+/home/peter/x16/cc65/lib/c64.lib(loadaddr.o):
+    LOADADDR          Offs=000000  Size=000002  Align=00001  Fill=0000
+
+
+Segment list:
+-------------
+Name                   Start     End    Size  Align
+----------------------------------------------------
+ZEROPAGE              000022  00007E  00005D  00001
+ZP2                   0000A9  0000AD  000005  00001
+LOADADDR              0007FF  000800  000002  00001
+EXEHDR                000801  00080C  00000C  00001
+CODE                  00080D  002F65  002759  00001
+RODATA                002F66  003853  0008EE  00001
+DATA                  003854  003B28  0002D5  00001
+
+
+Exports list by name:
+---------------------
+__EXEHDR__                000001 REA    __HEADER_LAST__           00080D RLA    
+__HIMEM__                 009F00 REA    __LOADADDR__              000001 REA    
+__ONCE_RUN__              003B29 RLA    __STACKSIZE__             000800 REA    
+
+
+
+Exports list by value:
+----------------------
+__EXEHDR__                000001 REA    __LOADADDR__              000001 REA    
+__STACKSIZE__             000800 REA    __HEADER_LAST__           00080D RLA    
+__ONCE_RUN__              003B29 RLA    __HIMEM__                 009F00 REA    
+
+
+
+Imports list:
+-------------
+__EXEHDR__ (exehdr.o):
+    [linker generated]        galaforce1-c64.cfg(6)
+__HEADER_LAST__ ([linker generated]):
+    [linker generated]        galaforce1-c64.cfg(17)
+    [linker generated]        galaforce1-c64.cfg(17)
+__HIMEM__ ([linker generated]):
+    [linker generated]        galaforce1-c64.cfg(18)
+    [linker generated]        galaforce1-c64.cfg(17)
+__LOADADDR__ (loadaddr.o):
+    [linker generated]        galaforce1-c64.cfg(5)
+__ONCE_RUN__ ([linker generated]):
+    [linker generated]        galaforce1-c64.cfg(18)
+    [linker generated]        galaforce1-c64.cfg(18)
+__STACKSIZE__ ([linker generated]):
+    [linker generated]        galaforce1-c64.cfg(18)
+
