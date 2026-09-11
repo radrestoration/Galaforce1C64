@@ -159,6 +159,41 @@ srt_col:
  JSR  star_pick_pattern
  RTS
 
+; is_row_protected: temp1 = row to check. Sets star_row_protected = 1 if
+; the row is one of the 3 permanently HUD-reserved rows a star must never
+; occupy - row 3 (the score bar, "SCR .... HI ......") or rows 23/24 (the
+; level flags and lives icons) - else 0. That text is drawn with ORA and
+; never redrawn/erased once placed (unlike a moving ship/alien), so an
+; errant star bit landing there would never get cleaned up - the actual
+; cause of the score-corruption bug (print_bitmap_line's own
+; star_evict_range call only protects a letter at the MOMENT it's drawn,
+; not for the rest of the game afterward, while a star's fall keeps
+; going). These 3 rows are reserved identically on every screen (title/
+; game/high-scores all use them the same way), so excluding them from the
+; star band entirely up front is simpler and far more robust than trying
+; to evict/restore a star every single frame it might wander through a
+; static HUD element - used by si_row below (initial placement) and
+; movestars' ms_wrap_row (every row a falling star advances into).
+; Doesn't touch X - both call sites index stars via X and must keep it.
+star_row_protected:
+ .byte 0
+
+is_row_protected:
+ LDA  temp1
+ CMP  #3
+ BEQ  irp_yes
+ CMP  #23
+ BEQ  irp_yes
+ CMP  #24
+ BEQ  irp_yes
+ LDA  #0
+ STA  star_row_protected
+ RTS
+irp_yes:
+ LDA  #1
+ STA  star_row_protected
+ RTS
+
 ; star_init: populates all STAR_COUNT stars at random positions spread
 ; through the whole band (so it isn't empty/bunched at the top the first
 ; time the screen appears) with random slots/colors, and plots them.
@@ -174,10 +209,18 @@ si_row:
                           ; 0-24, full screen) before the reject-retry below
  CMP  #BAND_ROWS
  BCS  si_row
+ STA  temp1              ; temp1 = candidate row (scratch - see
+                          ; INIT.asm's zero-page usage note; free here,
+                          ; nothing else runs during star_init) - saved
+                          ; here since is_row_protected needs A and this
+                          ; value is still needed below
+ JSR  is_row_protected
+ LDA  star_row_protected
+ BNE  si_row              ; row 3/23/24 - reject and re-roll
+ LDA  temp1
  STA  star_rowcnt,x
- STA  temp1              ; temp1 = row offset within the band (scratch -
-                          ; see INIT.asm's zero-page usage note; free here,
-                          ; nothing else runs during star_init)
+ STA  temp1              ; temp1 = row offset within the band (reused
+                          ; below for the *320 multiply loop)
  LDA  #<($6000+BAND_MIN_ROW*320)
  STA  stardat,x
  LDA  #>($6000+BAND_MIN_ROW*320)
@@ -283,6 +326,11 @@ ms_no_recolor:
 ms_start:
  LDX  #0
 ms_loop:
+ LDA  star_hidden,x
+ BNE  ms_next             ; a hard object (ship/alien) currently owns this
+                           ; star's cell (see star_evict_range) - frozen in
+                           ; place, no erase/move/redraw, until it's
+                           ; uncovered and star_restore_range redraws it
  LDA  stardat,x
  STA  temp3
  LDA  stardat+1,x
@@ -311,6 +359,15 @@ ms_wrap_row:
  LDA  stardat+1,x
  ADC  #>(320-7)
  STA  stardat+1,x
+ LDA  star_rowcnt,x
+ STA  temp1
+ JSR  is_row_protected
+ LDA  star_row_protected
+ BNE  ms_wrap_row         ; row 3/23/24 - advance past it too; re-checks
+                           ; the BAND_ROWS-1 bound each time round, so a
+                           ; star that would land on 23 then 24 (adjacent
+                           ; protected rows) correctly respawns instead
+                           ; of ever being drawn at either
  JMP  ms_pick_color
 
 ms_respawn:
@@ -332,6 +389,7 @@ ms_draw:
  EOR  (temp3),y
  STA  (temp3),y          ; redraw at the new position
 
+ms_next:
  INX
  INX
  INX
@@ -346,6 +404,149 @@ star_frame_count:
 star_color_count:
  .byte 0
 ms_recolor_flag:
+ .byte 0
+
+; --- Per-cell ownership: star_evict_range/star_restore_range let a hard
+; object (ship/alien - see INIT.asm's draw_alien_bitmap_0/1/2, draw_ship,
+; draw_explosion_here, erase_alien_x, erase_ship) claim or release a byte
+; range of the bitmap without permanently desyncing any star's XOR parity
+; - the root cause of the "stuck star" bug (an object's overwrite-style
+; draw/erase used to clobber a star's cell with no way for the star to
+; know its own bit got destroyed).
+;
+; star_hidden (declared in Master-c64.mak.asm alongside stardat/
+; star_rowcnt/star_slot, same 3*31 stride so it shares the identical X
+; index everywhere - deliberately not a second loop counter, since a
+; stride mismatch between two related arrays is exactly the kind of
+; indexing bug that caused a real crash earlier this session) - nonzero
+; means this star is currently covered and frozen; movestars (above)
+; skips a hidden star entirely; both routines below fully preserve X, Y
+; AND temp3/temp3+1 - draw_alien_bitmap_0/1/2 etc. rely on temp3 still
+; holding the cell-band base address the instant one of these calls
+; returns, so treating them as a black box that disturbs nothing but
+; star_hidden/the actual star pixels removes the need for every one of
+; the ~20 call sites to remember to save/restore anything themselves.
+sce_range_lo:
+ .byte 0
+sce_range_hi:
+ .byte 0
+sce_range_len:
+ .byte 0
+
+; star_evict_range: caller sets sce_range_lo/hi (16-bit base address) and
+; sce_range_len (range size in bytes - 24 for a full cell-band, 8 for one
+; cell) before calling. Scans all stars; any whose current position falls
+; in [base, base+len) and isn't already hidden gets XOR'd off and marked
+; hidden.
+star_evict_range:
+ TXA
+ PHA
+ TYA
+ PHA
+ LDA  temp3
+ PHA
+ LDA  temp3+1
+ PHA
+
+ LDX  #0
+ser_loop:
+ LDA  star_hidden,x
+ BNE  ser_next             ; already hidden - leave it
+ LDA  stardat,x
+ SEC
+ SBC  sce_range_lo
+ STA  ser_diff_lo
+ LDA  stardat+1,x
+ SBC  sce_range_hi
+ BNE  ser_next             ; hi byte of (addr-base) nonzero -> out of range
+ LDA  ser_diff_lo
+ CMP  sce_range_len
+ BCS  ser_next              ; (addr-base) >= len -> out of range
+
+ LDA  stardat,x
+ STA  temp3
+ LDA  stardat+1,x
+ STA  temp3+1
+ LDY  #0
+ LDA  stardat+2,x
+ EOR  (temp3),y
+ STA  (temp3),y
+ LDA  #1
+ STA  star_hidden,x
+ser_next:
+ INX
+ INX
+ INX
+ CPX  #(STAR_COUNT*3)
+ BNE  ser_loop
+
+ PLA
+ STA  temp3+1
+ PLA
+ STA  temp3
+ PLA
+ TAY
+ PLA
+ TAX
+ RTS
+ser_diff_lo:
+ .byte 0
+
+; star_restore_range: same inputs/range test as star_evict_range, opposite
+; direction - any star in range that IS hidden gets un-hidden and XOR'd
+; back on at its current (frozen) position.
+star_restore_range:
+ TXA
+ PHA
+ TYA
+ PHA
+ LDA  temp3
+ PHA
+ LDA  temp3+1
+ PHA
+
+ LDX  #0
+srr_loop:
+ LDA  star_hidden,x
+ BEQ  srr_next             ; not hidden - nothing to restore
+ LDA  stardat,x
+ SEC
+ SBC  sce_range_lo
+ STA  srr_diff_lo
+ LDA  stardat+1,x
+ SBC  sce_range_hi
+ BNE  srr_next
+ LDA  srr_diff_lo
+ CMP  sce_range_len
+ BCS  srr_next
+
+ LDA  #0
+ STA  star_hidden,x
+ LDA  stardat,x
+ STA  temp3
+ LDA  stardat+1,x
+ STA  temp3+1
+ LDY  #0
+ LDA  stardat+2,x
+ EOR  (temp3),y
+ STA  (temp3),y
+srr_next:
+ INX
+ INX
+ INX
+ CPX  #(STAR_COUNT*3)
+ BNE  srr_loop
+
+ PLA
+ STA  temp3+1
+ PLA
+ STA  temp3
+ PLA
+ TAY
+ PLA
+ TAX
+ RTS
+srr_diff_lo:
  .byte 0
 
 
