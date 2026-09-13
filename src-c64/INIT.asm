@@ -1,6 +1,16 @@
-;; C64 startup, title screen, and the minimal playable game loop
-;; (splash -> press SPACE/RETURN -> ship + stars + bullets, Z/X/:/​/ to
-;; move, RETURN to fire).
+;;
+;; Galaforce 1 ( BBC Micro ) from the original 6502 source code, adapted to assemble using beebasm
+;;
+;; (c) Kevin Edwards 1986-2019
+;;
+;; Twitter @KevEdwardsRetro
+;;
+;; C64 port - startup,
+;; title/high-score/demo cycle, and the full game loop: ship movement
+;; and firing, real BBC-decoded alien types/spawn waves/flight patterns,
+;; collision detection, scoring, lives, wave progression, alien bullets,
+;; explosions, and music (see the file header further down, above
+;; start_tune, for the music system specifically).
 ;;
 ;; Everything on screen (text, stars, ship, alien, flags, lives icon,
 ;; bullets) is plotted as real bitmap pixels in VIC-II MULTICOLOR bitmap
@@ -56,8 +66,7 @@
 ;; elsewhere; colour holds a plain 0-15 foreground value; length and
 ;; temp1 are loop counters/scratch bytes reused for whatever the current
 ;; routine needs (a row index, a column, a countdown) - never assume a
-;; value in any of these survives a call to another routine. None of
-;; this is used by any other (still-unconverted) BBC-derived system yet.
+;; value in any of these survives a call to another routine.
 
 exec:
     sei
@@ -242,7 +251,7 @@ gs_return_held:
 gs_store_fire_prev:
     sta fire_key_prev
 
-    lda #0                  ; tune 0 - placeholder until real tune data exists
+    lda #0                  ; tune 0 = Game Start (see start_tune)
     jsr start_tune
 
 game_loop:
@@ -250,10 +259,54 @@ game_loop:
 gl_wait_raster:
     cmp $D012
     bne gl_wait_raster
+
+    jsr check_escape_key
+    bne gl_no_escape
+    jmp game_loop_escape     ; out of branch range - see pas_next's
+                              ; matching comment on why
+gl_no_escape:
+
+    ; P toggles a full freeze (stars/music/gameplay all skipped below) -
+    ; added for taking clean screenshots, not a real BBC feature. Edge-
+    ; detected the same way as the SPACE wave-debug key, so holding P
+    ; down doesn't just flicker the pause state every frame.
+    jsr check_pause_key
+    beq gl_pause_pressed
+    lda #0
+    sta pause_key_prev
+    jmp gl_pause_checked
+gl_pause_pressed:
+    lda pause_key_prev
+    bne gl_pause_checked
+    lda #1
+    sta pause_key_prev
+    lda game_paused
+    eor #1
+    sta game_paused
+gl_pause_checked:
+    lda game_paused
+    beq gl_not_paused
+    jmp game_loop
+gl_not_paused:
+
     jsr movestars
     jsr refresh_music
-    jsr check_escape_key
-    beq game_loop_escape
+
+    lda game_state
+    cmp #GS_PLAYING
+    bne gl_no_wave_debug
+    jsr check_space_key
+    beq gl_wave_debug_pressed
+    lda #0
+    sta wave_debug_key_prev
+    jmp gl_no_wave_debug
+gl_wave_debug_pressed:
+    lda wave_debug_key_prev
+    bne gl_no_wave_debug        ; already held - only fire on the press
+    lda #1
+    sta wave_debug_key_prev
+    jsr advance_to_next_wave
+gl_no_wave_debug:
 
     lda game_state
     cmp #GS_SHIP_EXPLODING
@@ -265,22 +318,23 @@ gl_wait_raster:
     jsr demo_process_fire
     jsr move_bullets
     jsr move_alien_bullets
+
+    ; A collision below may call ship_crash, which sets game_state to
+    ; GS_SHIP_EXPLODING mid-frame - skip try_load_next_group in that
+    ; case (real ALIENS1.asm's own "LDAmyst:BPLinit_new_al2" gate - it
+    ; would otherwise see the just-cleared alien pool/counters as "ready
+    ; for the next group" and load it while the ship's explosion is
+    ; still playing, before it's even respawned).
+    lda game_state
+    cmp #GS_PLAYING
+    bne game_loop_no_wave_check
+    jsr try_load_next_group
+game_loop_no_wave_check:
     jsr process_alien_spawns
     jsr alien_move_tick
     jsr check_bullet_alien_collisions
     jsr check_alien_bullet_ship_collision
     jsr check_alien_ship_collision
-
-    ; A collision just above may have called ship_crash, which sets
-    ; game_state to GS_SHIP_EXPLODING mid-frame - skip check_wave_clear in
-    ; that case (it would otherwise see the just-cleared alien pool as a
-    ; finished wave and advance/repopulate it while the ship's explosion
-    ; is still playing, before it's even respawned).
-    lda game_state
-    cmp #GS_PLAYING
-    bne game_loop_no_wave_check
-    jsr check_wave_clear
-game_loop_no_wave_check:
     jmp game_loop
 gl_exploding:
     jsr ship_explode_tick_throttled
@@ -356,6 +410,13 @@ check_return_key:
     sta $DC00
     lda $DC01
     and #$02                ; row bit 1 = RETURN
+    rts
+
+check_pause_key:
+    lda #$DF              ; clear bit5: select column 5 (P's column)
+    sta $DC00
+    lda $DC01
+    and #$02                ; row bit 1 = P
     rts
 
 ; handle_ship_input: polls Z/X (left/right) and ":"/"/" (up/down - see
@@ -539,6 +600,18 @@ bullet_col:
  .res BULLET_COUNT
 fire_key_prev:
  .byte 0
+; wave_debug_key_prev: press-edge debounce for the SPACE-forces-next-
+; wave debug key (see game_loop/advance_to_next_wave) - TEMPORARY, same
+; status as the SPACE/RETURN demo-vs-play shortcuts already in this
+; file, meant for testing waves 1-15 without waiting out a full wave 0.
+wave_debug_key_prev:
+ .byte 0
+; game_paused/pause_key_prev: P-toggles-freeze debug feature (see
+; game_loop) for taking clean screenshots - not a real BBC feature.
+game_paused:
+ .byte 0
+pause_key_prev:
+ .byte 0
 
 ; compute_bullet_addr: X = bullet slot index. Sets temp3 (word) = bitmap
 ; address of cell (bullet_row[X], bullet_col[X]) - bitmap only, bullets
@@ -673,15 +746,15 @@ spb_row_set:
 ; move_bullets: advances every active bullet one cell-row up per call,
 ; deactivating instead of wrapping once it passes row 0 (compare
 ; movestars, which respawns - bullets just vanish off the top). BBC
-; moves bullets a full row EVERY frame, untouched - our own throttle
-; was slowing that down 8x just to make it easier to eyeball; brought
-; down to a still-visible-but-real 3x instead of the untouched 1x since
-; there's nothing on screen to shoot at yet to judge full speed against
-; (revisit once aliens exist - phase 5). Colors (currently substituted
-; white -> magenta, red -> cyan, per the 3-non-black-per-cell budget -
-; see the bullet_bitmap note above) are also accepted "for now", not
-; final - revisit those too when picking the game's real palette.
-BULLET_MOVE_SLOWDOWN = 3
+; moves bullets a full row EVERY frame, untouched - but running this
+; port at that real 1x rate (alongside the alien/alien-bullet throttles
+; below also going to 1x) turned out too fast, not too slow, once
+; combined - a deliberate 2x throttle kept in reserve here (not a
+; guess at a "correct" value, just a speed budget) so there's still
+; room to slow back down as more real complexity (remaining alien
+; sprites, sound effects, more wave variety) lands and changes the
+; overall pace again.
+BULLET_MOVE_SLOWDOWN = 2
 bullet_move_count:
  .byte 0
 
@@ -740,22 +813,39 @@ mbs_next:
 mbs_rts:
     rts
 
-; --- Alien bullets: a second, separate pool sized to CONST.asm's
-; almaxbull (6), mirroring the player pool above but moving down instead
-; of up. Nothing spawns into this yet - aliens don't fire until they
-; exist (see the plan's phase 5) - but the pool, draw and move mechanics
-; are built now so alien work doesn't have to bolt bullets on afterward.
-; move_alien_bullets is already called from game_loop; with every slot
-; inactive it's just a cheap no-op pass over 6 flags.
+; --- Alien bullets: a second, separate pool (6 slots, matching
+; src/CONST.asm's real almaxbull), mirroring the player pool above but
+; moving down instead of up. Spawned by alien_fire_bomb (DAT_DROPBOMB in
+; the pattern interpreter below).
 ;
-; The graphic below is a PLACEHOLDER, not a decode: BOMBS2.asm's real
-; alien bomb (.albomb, 10 bytes) is plotted through xycalc2 at an
-; arbitrary (non cell-aligned) pixel row, and its last 2 bytes land in
-; the scanlines of the NEXT cell down - properly decoding that needs
-; xycalc2's addressing worked out first, which isn't needed until
-; something actually fires one of these. Reusing the player bullet's
-; shape here is an explicit stand-in, not a guess at the real graphic.
+; alien_bullet_bitmap: real data now, decoded from BOMBS2.asm's
+; .albomb (10 bytes: 8,12,20,20,20,20,20,20,8,8). The "non-cell-aligned,
+; spills into the next cell down" premise this was previously blocked
+; on turned out to be wrong when actually re-checked against the real
+; code: init_bomb's spawn-Y computation does "ADC#8:AND#&F8", which
+; unconditionally zeroes the low 3 bits, and every subsequent move adds
+; 8 to an already-multiple-of-8 value - so the real sub_row xycalc2
+; receives is always 0 in practice, never anything else. Bytes 0-7
+; exactly fill one 8-scanline cell (green cap, 6 identical cyan stem
+; rows); only the last 2 bytes (also green) ever spill, and they land
+; in the TOP of the NEXT COLUMN OVER (xycalc2's X*8 addressing - a
+; column step, not a row step), not a row below - a real, harmless,
+; barely-visible artifact of the original's byte-oriented blit, not
+; something worth new engine support for. Compressed to 8 rows here by
+; dropping 2 of the 6 pixel-identical cyan stem rows (rows 2-7 all
+; decode to the exact same "black,cyan" byte - dropping any 2 of them
+; is visually lossless, just a marginally shorter stem), keeping the
+; real cap-stem-cap silhouette in the existing single-cell convention.
+; Real colors are green (cap) and cyan (stem) - cyan is already one of
+; this shared XOR palette's 3 colors (yellow/cyan/magenta, see
+; clear_screen), so only green needs substituting; mapped to yellow
+; (not magenta, so alien bullets read as visually distinct from the
+; player's white-substituted-to-magenta ones) - the same kind of single
+; color-reduction the player bullet already needed, not a shape change.
 ALIEN_BULLET_COUNT = 6
+
+alien_bullet_bitmap:
+ .byte $40,$50,$20,$20,$20,$20,$40,$50
 
 alien_bullet_active:
  .res ALIEN_BULLET_COUNT
@@ -816,7 +906,7 @@ draw_alien_bullet_x:
     jsr compute_alien_bullet_addr
     ldy #0
 dabx_loop:
-    lda bullet_bitmap,y
+    lda alien_bullet_bitmap,y
     eor (temp3),y
     sta (temp3),y
     iny
@@ -826,8 +916,9 @@ dabx_loop:
 
 ; move_alien_bullets: mirrors move_bullets, downward - advances every
 ; active alien bullet one cell-row per call, deactivating past row 24
-; (the last row) instead of wrapping.
-ALIEN_BULLET_MOVE_SLOWDOWN = 3
+; (the last row) instead of wrapping. Same reserved 2x throttle as
+; BULLET_MOVE_SLOWDOWN, same reasoning - see its comment.
+ALIEN_BULLET_MOVE_SLOWDOWN = 2
 alien_bullet_move_count:
  .byte 0
 
@@ -870,6 +961,7 @@ mabs_erase_skip:
 mabs_deactivate:
     lda #0
     sta alien_bullet_active,x
+    dec alien_bullet_live_count
 mabs_next:
     inx
     cpx #ALIEN_BULLET_COUNT
@@ -884,24 +976,53 @@ mabs_rts:
 ; isn't a guess: ALIENS1.asm's spawn-group records (see alien_spawn_table
 ; below) each carry a raw `initgra` byte, and ALIENS2.asm reads it as
 ; "LDY algra,X : LDX graph,Y : LDA graph+1,Y" - Y indexes BYTES into a
-; table of 2-byte pointers, so the real entry index is initgra/2. Wave
-; 0's groups (patt0/2/43/1/11/10 in PATT.asm) use initgra 12, 18 and 16 -
-; entries 6, 9 and 8 - all three decode as clean, symmetric, distinct
-; shapes with this correction, which is what confirms it rather than
-; just fitting numerically.
+; table of 2-byte pointers, so the real entry index is initgra/2, and
+; the real per-type index used everywhere in this port (alien_type,
+; alien_hp_table/alien_score_table, this table set) is (initgra-12)/2 -
+; traced from ALIENS2.asm's own "SEC:SBC#12:LSRA".
+;
+; alien_bitmap_0/1/2 were the first three decoded (this port's original
+; 3-type era); a later full 12-type decode pass (verified pixel-exact
+; against these three before trusting the other 9) turned up that
+; alien_bitmap_1 is real type 3 (gra=18), not type 1 (gra=14) as first
+; assumed - type 1 was never actually decoded, it just happened to get
+; a plausible-looking label. Real type 1 data was decoded in a later
+; pass and lives at alien_bitmap_1b (see alien_bitmap_lo/hi near
+; draw_alien_x) - the _1b name, not _1, because _1 was already taken by
+; the mislabeled real type 3 by the time this was sorted out.
+; Also worth knowing: type 5 (gra=22) decodes to the exact same raw
+; pixels as the player ship, upside down relative to ship_bitmap (their
+; graph-table blocks are byte-identical once row-reversed) - confirmed,
+; not an artifact of decoding it differently.
 ;
 ; Colors reduced per-type (each type's own dominant colors, not a shared
-; palette): type 0/entry 6 keeps blue/cyan/white (nothing major needed
-; substituting away); type 1/entry 9 keeps red/blue/magenta (yellow and
-; cyan were 2-3 stray pixels each, folded into the nearest); type 2/
-; entry 8 keeps blue/cyan/magenta (2 stray red pixels folded into
-; magenta).
+; palette), stray/minor pixels folded into whichever major color they
+; were spatially adjacent to (measured, not guessed) - except type 8,
+; where the fold was a near-tie (red 23 vs blue 21 neighbors) and is
+; flagged here as the one genuinely low-confidence color call.
 ALIEN_MATRIX_0   = $63  ; hi=6 blue (01), lo=3 cyan (10)
 ALIEN_COLORRAM_0 = $01  ; white (11)
 ALIEN_MATRIX_1   = $26  ; hi=2 red (01), lo=6 blue (10)
 ALIEN_COLORRAM_1 = $04  ; magenta (11)
 ALIEN_MATRIX_2   = $63  ; hi=6 blue (01), lo=3 cyan (10)
 ALIEN_COLORRAM_2 = $04  ; magenta (11)
+ALIEN_MATRIX_4   = $57  ; hi=5 green (01), lo=7 yellow (10)
+ALIEN_COLORRAM_4 = $03  ; cyan (11)
+ALIEN_MATRIX_5   = $17  ; hi=1 white (01), lo=7 yellow (10) - same as
+ALIEN_COLORRAM_5 = $03  ; cyan (11) - SHIP_MATRIX_BYTE/SHIP_COLORRAM_BYTE
+ALIEN_MATRIX_6   = $24  ; hi=2 red (01), lo=4 magenta (10)
+ALIEN_COLORRAM_6 = $07  ; yellow (11)
+ALIEN_MATRIX_7   = $36  ; hi=3 cyan (01), lo=6 blue (10)
+ALIEN_COLORRAM_7 = $06  ; blue (11) - unused (only 2 real colors in this one)
+ALIEN_MATRIX_8   = $26  ; hi=2 red (01), lo=6 blue (10)
+ALIEN_COLORRAM_8 = $05  ; green (11)
+ALIEN_MATRIX_9   = $24  ; hi=2 red (01), lo=4 magenta (10) - shared by
+ALIEN_COLORRAM_9 = $04  ; magenta (11) - types 9/10/11 (identical source)
+; Real type 1 (gra=14) - named _1B, not _1, because ALIEN_MATRIX_1/
+; alien_bitmap_1 already belong to real type 3 (gra=18) - see the
+; alien_bitmap_lo/hi header below for how that mislabeling happened.
+ALIEN_MATRIX_1B   = $53  ; hi=5 green (01), lo=3 cyan (10)
+ALIEN_COLORRAM_1B = $02  ; red (11)
 
 alien_bitmap_0:
  .byte $00,$03,$0f,$0d,$25,$25,$09,$02
@@ -926,6 +1047,70 @@ alien_bitmap_2:
  .byte $00,$00,$02,$28,$d6,$d5,$35,$0f
  .byte $28,$aa,$aa,$aa,$28,$82,$c3,$00
  .byte $00,$00,$80,$28,$97,$57,$5c,$f0
+
+alien_bitmap_4:
+ .byte $02,$09,$24,$93,$93,$94,$95,$25
+ .byte $aa,$55,$00,$c3,$c3,$00,$55,$55
+ .byte $80,$60,$18,$c6,$c6,$16,$56,$58
+ .byte $0a,$00,$02,$29,$95,$95,$26,$08
+ .byte $55,$96,$55,$55,$69,$82,$00,$00
+ .byte $a0,$00,$80,$68,$56,$56,$98,$20
+
+alien_bitmap_5:
+ .byte $40,$91,$66,$69,$61,$65,$69,$4a
+ .byte $88,$a9,$56,$75,$fd,$fd,$fd,$fe
+ .byte $04,$18,$64,$a4,$24,$64,$a4,$84
+ .byte $c2,$02,$01,$01,$03,$00,$00,$00
+ .byte $fe,$ba,$a9,$65,$13,$10,$10,$30
+ .byte $0c,$00,$00,$00,$00,$00,$00,$00
+
+alien_bitmap_6:
+ .byte $54,$19,$06,$01,$06,$25,$9f,$9d
+ .byte $00,$01,$46,$99,$9a,$99,$67,$65
+ .byte $54,$90,$40,$00,$40,$60,$d8,$d8
+ .byte $65,$1a,$06,$01,$01,$06,$19,$54
+ .byte $99,$56,$9a,$a9,$99,$46,$01,$00
+ .byte $64,$90,$40,$00,$00,$40,$90,$54
+
+alien_bitmap_7:
+ .byte $14,$69,$65,$14,$01,$06,$06,$06
+ .byte $00,$01,$01,$54,$a9,$a5,$95,$95
+ .byte $50,$84,$94,$50,$00,$40,$40,$40
+ .byte $06,$06,$05,$01,$14,$69,$65,$14
+ .byte $55,$55,$55,$55,$54,$01,$01,$00
+ .byte $40,$40,$40,$00,$50,$a4,$94,$50
+
+alien_bitmap_8:
+ .byte $54,$64,$51,$05,$16,$59,$59,$5a
+ .byte $10,$54,$69,$aa,$56,$fd,$fd,$56
+ .byte $54,$64,$14,$40,$90,$a4,$a4,$a4
+ .byte $5a,$6a,$69,$1a,$06,$51,$64,$54
+ .byte $aa,$56,$fd,$56,$aa,$a9,$64,$10
+ .byte $a4,$a4,$a4,$90,$40,$14,$64,$54
+
+; alien_bitmap_9: real type 9 (gra=30); types 10/11 (gra=32/34) point at
+; the exact same graph-table entry ($2F40, confirmed via direct pointer
+; comparison), so they share this same data - see alien_bitmap_lo/hi.
+alien_bitmap_9:
+ .byte $05,$18,$60,$68,$22,$09,$25,$09
+ .byte $00,$00,$41,$aa,$55,$55,$55,$55
+ .byte $60,$18,$06,$1a,$88,$60,$58,$60
+ .byte $09,$25,$09,$22,$68,$60,$18,$05
+ .byte $55,$55,$55,$55,$aa,$41,$00,$00
+ .byte $60,$58,$60,$88,$1a,$06,$18,$60
+
+; alien_bitmap_1b: real type 1 (gra=14) - the one gap left after the
+; earlier 9-type decode pass, closed the same way (calibrated by
+; re-deriving alien_bitmap_0/2 from O.GRAPHIC and matching them byte-
+; exact before trusting this one). Named _1b, not _1 - see ALIEN_MATRIX_
+; 1B's own comment on why that name is already taken.
+alien_bitmap_1b:
+ .byte $15,$50,$51,$15,$05,$04,$04,$05
+ .byte $00,$41,$55,$55,$41,$00,$ff,$ff
+ .byte $54,$05,$45,$54,$50,$10,$10,$50
+ .byte $01,$04,$15,$56,$58,$56,$15,$05
+ .byte $7d,$00,$55,$a5,$00,$00,$81,$42
+ .byte $40,$20,$58,$56,$16,$56,$58,$a0
 
 ; compute_alien_addr: X = alien slot index. Sets temp3 (word) = bitmap
 ; address of cell (alien_row[X], alien_col[X]), temp4 (word) = screen-
@@ -1003,10 +1188,9 @@ caa_row_done:
 ; against whatever background (or star) was already there would produce
 ; wrong colors, not a clean toggle - see the file header's note on
 ; shared-palette (XOR-safe) vs. own-palette (must-own-the-cell)
-; objects. Dispatches on alien_type,X to one of 3 fixed-shape draw
-; routines (temp3/temp4/temp2 already point at the right cell by the
-; time they run - compute_alien_addr is only called once here, not
-; inside each). Preserves X.
+; objects. Looks up alien_type,X in the 12-entry bitmap/matrix/colorram
+; tables below (temp3/temp4/temp2 already point at the right cell by
+; compute_alien_addr, called once here, not per-type). Preserves X.
 ;
 ; Two overlapping own-palette objects still color-clash where they share
 ; a cell (whichever draws most recently wins that cell's bitmap AND
@@ -1018,23 +1202,69 @@ caa_row_done:
 ; whenever a shared cell's occupants changed) made overlaps look
 ; messier, not cleaner, and cost enough extra per-cell work to be
 ; noticeably slower.
+;
+; alien_bitmap_lo/hi/alien_matrix_table/alien_colorram_table: real data
+; for all 12 alien types now, decoded via the same dual-buffer
+; O.GRAPHIC transform verified against the explosion frames and the
+; original 3 alien bitmaps, cross-checked pixel-exact against
+; alien_bitmap_0/2 before being trusted on each new entry (including
+; type 1, the last gap, closed the same way). Real findings worth
+; keeping in mind, not artifacts of this port: type 3 (gra=18) IS
+; alien_bitmap_1 - the original 3-type simplification had already
+; decoded it, just mislabeled as "type 1" (which is why real type 1's
+; own data below is named alien_bitmap_1b, not _1 - that name was
+; already taken by the time the mislabeling was found); type 5 (gra=22)
+; decodes to the SAME raw pixels as the player ship, upside down
+; relative to ship_bitmap (their graph-table blocks are byte-identical
+; once row-reversed) - a real, verified fact about the source data, not
+; something to silently "correct". Types 9/10/11 (gra=30/32/34) all
+; point at the exact same graph-table entry, so they share one bitmap/
+; color entry.
+alien_bitmap_lo:
+ .byte <alien_bitmap_0, <alien_bitmap_1b, <alien_bitmap_2, <alien_bitmap_1
+ .byte <alien_bitmap_4, <alien_bitmap_5, <alien_bitmap_6, <alien_bitmap_7
+ .byte <alien_bitmap_8, <alien_bitmap_9, <alien_bitmap_9, <alien_bitmap_9
+alien_bitmap_hi:
+ .byte >alien_bitmap_0, >alien_bitmap_1b, >alien_bitmap_2, >alien_bitmap_1
+ .byte >alien_bitmap_4, >alien_bitmap_5, >alien_bitmap_6, >alien_bitmap_7
+ .byte >alien_bitmap_8, >alien_bitmap_9, >alien_bitmap_9, >alien_bitmap_9
+alien_matrix_table:
+ .byte ALIEN_MATRIX_0, ALIEN_MATRIX_1B, ALIEN_MATRIX_2, ALIEN_MATRIX_1
+ .byte ALIEN_MATRIX_4, ALIEN_MATRIX_5, ALIEN_MATRIX_6, ALIEN_MATRIX_7
+ .byte ALIEN_MATRIX_8, ALIEN_MATRIX_9, ALIEN_MATRIX_9, ALIEN_MATRIX_9
+alien_colorram_table:
+ .byte ALIEN_COLORRAM_0, ALIEN_COLORRAM_1B, ALIEN_COLORRAM_2, ALIEN_COLORRAM_1
+ .byte ALIEN_COLORRAM_4, ALIEN_COLORRAM_5, ALIEN_COLORRAM_6, ALIEN_COLORRAM_7
+ .byte ALIEN_COLORRAM_8, ALIEN_COLORRAM_9, ALIEN_COLORRAM_9, ALIEN_COLORRAM_9
+
+; dab_type: scratch for draw_alien_bitmap_generic - X (alien slot) and Y
+; (cell-byte offsets) are both busy throughout the actual draw, so the
+; type index lives here instead (dab_ptr, the resolved bitmap pointer,
+; is declared in ZPWORK.asm - it must be zero page for indirect
+; addressing).
+dab_type:
+ .byte 0
+
 draw_alien_x:
     jsr compute_alien_addr
     lda alien_type,x
-    cmp #0
-    beq dax_t0
-    cmp #1
-    beq dax_t1
-    jmp draw_alien_bitmap_2
-dax_t0:
-    jmp draw_alien_bitmap_0
-dax_t1:
-    jmp draw_alien_bitmap_1
+    sta dab_type
+    tay
+    lda alien_bitmap_lo,y
+    sta dab_ptr
+    lda alien_bitmap_hi,y
+    sta dab_ptr+1
+    jmp draw_alien_bitmap_generic
 
-; draw_alien_bitmap_0/1/2: the 6-cells-worth-per-type copy + per-cell
-; color set, same "2 linear 24-byte rows, +320 between them" shortcut
-; draw_ship uses (adjacent cells in a row sit back to back in memory).
-draw_alien_bitmap_0:
+; draw_alien_bitmap_generic: temp2/temp3/temp4 already point at this
+; alien's color-RAM/bitmap/screen-matrix cells (compute_alien_addr);
+; dab_ptr/dab_type say which of the 12 real alien graphics to draw.
+; Replaces the old draw_alien_bitmap_0/1/2 (one near-identical routine
+; per type, unworkable at 12 types) with a single table-driven routine -
+; same "2 linear 24-byte rows, +320 between them" shortcut draw_ship
+; uses (adjacent cells in a row sit back to back in memory), just
+; reading through a runtime pointer instead of a compile-time label.
+draw_alien_bitmap_generic:
     lda temp3
     sta sce_range_lo
     lda temp3+1
@@ -1045,76 +1275,20 @@ draw_alien_bitmap_0:
                                ; overwrite - see STARS.asm's file header
                                ; note by star_evict_range
     ldy #0
-dab0_top:
-    lda alien_bitmap_0,y
+dabg_top:
+    lda (dab_ptr),y
     sta (temp3),y
     iny
     cpy #24
-    bne dab0_top
-    lda temp3
-    clc
-    adc #<320
-    sta temp3
-    lda temp3+1
-    adc #>320
-    sta temp3+1
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #24
-    sta sce_range_len
-    jsr star_evict_range
-    ldy #0
-dab0_bottom:
-    lda alien_bitmap_0+24,y
-    sta (temp3),y
-    iny
-    cpy #24
-    bne dab0_bottom
-    lda #ALIEN_MATRIX_0
-    ldy #0
-    sta (temp4),y
-    ldy #1
-    sta (temp4),y
-    ldy #2
-    sta (temp4),y
-    ldy #40
-    sta (temp4),y
-    ldy #41
-    sta (temp4),y
-    ldy #42
-    sta (temp4),y
-    lda #ALIEN_COLORRAM_0
-    ldy #0
-    sta (temp2),y
-    ldy #1
-    sta (temp2),y
-    ldy #2
-    sta (temp2),y
-    ldy #40
-    sta (temp2),y
-    ldy #41
-    sta (temp2),y
-    ldy #42
-    sta (temp2),y
-    rts
+    bne dabg_top
 
-draw_alien_bitmap_1:
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #24
-    sta sce_range_len
-    jsr star_evict_range
-    ldy #0
-dab1_top:
-    lda alien_bitmap_1,y
-    sta (temp3),y
-    iny
-    cpy #24
-    bne dab1_top
+    lda dab_ptr                ; dab_ptr += 24, for the bottom half
+    clc
+    adc #24
+    sta dab_ptr
+    bcc dabg_ptr_ok
+    inc dab_ptr+1
+dabg_ptr_ok:
     lda temp3
     clc
     adc #<320
@@ -1130,77 +1304,15 @@ dab1_top:
     sta sce_range_len
     jsr star_evict_range
     ldy #0
-dab1_bottom:
-    lda alien_bitmap_1+24,y
+dabg_bottom:
+    lda (dab_ptr),y
     sta (temp3),y
     iny
     cpy #24
-    bne dab1_bottom
-    lda #ALIEN_MATRIX_1
-    ldy #0
-    sta (temp4),y
-    ldy #1
-    sta (temp4),y
-    ldy #2
-    sta (temp4),y
-    ldy #40
-    sta (temp4),y
-    ldy #41
-    sta (temp4),y
-    ldy #42
-    sta (temp4),y
-    lda #ALIEN_COLORRAM_1
-    ldy #0
-    sta (temp2),y
-    ldy #1
-    sta (temp2),y
-    ldy #2
-    sta (temp2),y
-    ldy #40
-    sta (temp2),y
-    ldy #41
-    sta (temp2),y
-    ldy #42
-    sta (temp2),y
-    rts
+    bne dabg_bottom
 
-draw_alien_bitmap_2:
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #24
-    sta sce_range_len
-    jsr star_evict_range
-    ldy #0
-dab2_top:
-    lda alien_bitmap_2,y
-    sta (temp3),y
-    iny
-    cpy #24
-    bne dab2_top
-    lda temp3
-    clc
-    adc #<320
-    sta temp3
-    lda temp3+1
-    adc #>320
-    sta temp3+1
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #24
-    sta sce_range_len
-    jsr star_evict_range
-    ldy #0
-dab2_bottom:
-    lda alien_bitmap_2+24,y
-    sta (temp3),y
-    iny
-    cpy #24
-    bne dab2_bottom
-    lda #ALIEN_MATRIX_2
+    ldy dab_type
+    lda alien_matrix_table,y
     ldy #0
     sta (temp4),y
     ldy #1
@@ -1213,7 +1325,8 @@ dab2_bottom:
     sta (temp4),y
     ldy #42
     sta (temp4),y
-    lda #ALIEN_COLORRAM_2
+    ldy dab_type
+    lda alien_colorram_table,y
     ldy #0
     sta (temp2),y
     ldy #1
@@ -1771,7 +1884,12 @@ eax_c5_skip:
     rts
 
 ALIEN_COUNT = 8
-ALIEN_SPAWN_GROUPS = 7
+MAXPATT = 4                ; real CONST.asm value - concurrent spawn-group
+                            ; slots. NOT "4 groups from different wave-list
+                            ; entries at once" (see try_load_next_group's
+                            ; header) - just large enough for one entry's
+                            ; sub-records (patt45 needs 3, the largest).
+ALIEN_MAX_X = 149          ; safe right-edge wrap margin - see wrap_x_margin
 
 alien_active:
  .res ALIEN_COUNT
@@ -1807,24 +1925,18 @@ alien_loop_count:
 alien_loop_start:
  .res ALIEN_COUNT
 
-; --- Collision/death bookkeeping. alien_hit_points/alien_score are
-; simplified from ROUT2.asm's alien_hits/ROUT3.asm's alien_score - both
-; real BBC tables are indexed by a value derived from the alien's exact
-; graph-table entry (12-15+ distinct alien types); we only have 3 types
-; (alien_bitmap_0/1/2), so rather than re-derive that indexing for just
-; these 3, each gets its own flat per-type entry below. alien_score's
-; values happen to trace to the same source number (2, i.e. 20 points)
-; for all three of our actual entries (6/8/9) - not a simplification,
-; that's what the real table says for exactly these three - so
-; ALIEN_SCORE_0/1/2 being equal is real, not a placeholder. Hit points
-; ARE a simplification (the real table's spread, by graph-table index,
-; isn't re-traced here): 1/2/1, giving type 1 a LITTLE more durability,
-; not an exact source value.
-ALIEN_HP_0 = 1
-ALIEN_HP_1 = 2
-ALIEN_HP_2 = 1
+; --- Collision/death bookkeeping. alien_hp_table/alien_score_table are
+; the REAL ROUT2.asm alien_hits / ROUT3.asm alien_score tables, both
+; indexed 0-11 by the same (gra-12)/2 formula alien_type already uses
+; (traced from ALIENS2.asm's own "SEC:SBC#12:LSRA" indexing code, not
+; guessed) - 12 real entries now that all 12 real alien types are
+; reachable, not the old 3-entry simplification (which was also a real
+; latent bug: alien_score_table,X with X=alien_type read past the end
+; of a 3-byte table for any type >= 3, into whatever memory followed).
+alien_hp_table:
+ .byte 1, 1, 1, 1, 1, 10, 2, 5, 5, 2, 2, 2
 alien_score_table:
- .byte 2, 2, 2              ; source's alien_score units (x10 = real points)
+ .byte 2, 2, 2, 2, 4, 8, 4, 4, 6, 8, 8, 8   ; source's alien_score units (x10 = real points)
 
 alien_hp:
  .res ALIEN_COUNT
@@ -1835,28 +1947,15 @@ alien_explode_timer:
 EXPLOSION_FRAME_COUNT = 6   ; explosion_frame_0..5 - see draw_explosion_here
 
 ; init_alien_hp: X = alien slot (alien_type,X already set). Sets
-; alien_hp,X from the per-type table above and clears alien_exploding,X -
-; shared by pas_spawn and asc_spawn, both of which need identical fresh-
-; spawn bookkeeping. A 3-way dispatch, not an indexed table lookup - X is
-; already busy holding the pool slot and there's no free index register
-; to also index alien_score_table with, same reasoning as draw_alien_x's
-; own type dispatch.
+; alien_hp,X from alien_hp_table and clears alien_exploding,X - shared
+; by pas_spawn and asc_spawn, both of which need identical fresh-spawn
+; bookkeeping. Y is free here (unlike X, which is busy holding the pool
+; slot), so this is a plain indexed lookup, not a dispatch.
 init_alien_hp:
     lda #0
     sta alien_exploding,x
-    lda alien_type,x
-    cmp #0
-    beq iah_t0
-    cmp #1
-    beq iah_t1
-    lda #ALIEN_HP_2
-    jmp iah_store
-iah_t0:
-    lda #ALIEN_HP_0
-    jmp iah_store
-iah_t1:
-    lda #ALIEN_HP_1
-iah_store:
+    ldy alien_type,x
+    lda alien_hp_table,y
     sta alien_hp,x
     rts
 
@@ -1879,113 +1978,367 @@ aet_finish:
     lda #0
     sta alien_active,x
     sta alien_exploding,x
+    dec alien_live_count
     jsr erase_alien_x
     rts
 
-; alien_spawn_table: wave 0's 7 real spawn-group entries (PATT.asm's
-; patt0, patt2, patt43's 2 sub-entries, patt1, patt11, patt10 - the
-; groups WAVE.asm's wave0 byte list 0,2,43,1,11,10 selects), not
-; invented placement. Columns: spawn col, spawn row, type (0/1/2 into
-; the alien_bitmap_N above), delay, count, pattern selector - straight
-; from each patt entry's x/y/initdel/initnum/initpnum fields. x
-; converted BBC-byte-columns -> C64 cells (1 BBC byte = 2 BBC pixels =
-; half a C64 cell, so col = BBC x/2); y converted BBC-scanlines -> C64
-; rows (row = BBC y/8). patt43's x=78/79 would put a 3-cell-wide
-; alien's right edge off the 40-column screen, so clamped to 37 (40-3),
-; the same edge clamp draw_ship/the lives icons already use. Pattern
-; selector is initpnum as-is: bit7 = reflect (see alien_select_pattern),
+; alien_spawn_table: ALL 46 real spawn groups (PATT.asm's patt0-patt45),
+; flattened to 54 rows (6 groups have 2 sub-records, patt45 has 3 - see
+; PATT.asm's own EQUB1/EQUB2/EQUB3 sub-record counts). 8 columns, from
+; ALIENS1.asm's own record-reading code (the real field order: x, y,
+; delay, count, relx, rely, gra, pnum - traced from ALIENS1.asm:71-88,
+; not guessed from the data's spacing, which is what led to relx/rely
+; being dropped entirely the first time this was decoded):
+;   col, row, type, delay, count, pattern, relx, rely
+; col/row: spawn position. x converted BBC-byte-columns -> C64 cells (1
+; BBC byte = 2 BBC pixels = half a C64 cell, so col = BBC x/2, clamped
+; to 37 so a 3-cell-wide alien's right edge can't go off the 40-column
+; screen - same edge clamp draw_ship/the lives icons use - this is a
+; real width match, BBC MODE 2 is 160 pixels wide and so is our screen,
+; so no scaling is needed on this axis, just the same footprint margin
+; used everywhere else). row is the REAL, unscaled BBC row (y/8, 0-31 -
+; the BBC screen is 256 scanlines/32 rows tall, a real 7-row/56-scanline
+; difference from our 200-scanline/25-row screen, confirmed via
+; ROUT1.asm's line_start/line_starth). This used to be clamped into
+; [4,21] here at data-authoring time - a design decision made and never
+; checked. Real Y is unbounded on the BBC (ALIENS3.asm never bounds-
+; checks it), so real spawns like patt4/6/7/23/24/25/26's y=231/255 are
+; genuine, valid BBC positions, not overflow - clamping them distorted
+; the source data. Scaling the real row onto our shorter screen instead
+; of clamping it happens at RUNTIME now, in row_scale_table (see its own
+; header, near alien_refresh_display) - this table keeps the real,
+; unscaled row so the master data stays exactly what PATT.asm says.
+; type: (gra-12)/2 - the real ALIENS2.asm indexing formula (traced from
+; its "SEC:SBC#12:LSRA" - see the collision/death bookkeeping comment
+; below), giving all 12 real alien types now, not the old 3-type
+; simplification.
+; delay/count: initdel/initnum as-is (spawn cadence, total spawns).
+; pattern: initpnum as-is - bit7 = reflect (see alien_select_pattern),
 ; bits0-6 = which patdat block (0-29, pattern_table below).
+; relx/rely: initrelx/initrely, PRE-SCALED into the same raw units as
+; alien_x/alien_y (relx*2, rely*1 - same x2/y1 factors as
+; addrelx_tab/addrely_tab, see their own header). After EVERY individual
+; spawn from a group, ALIENS2.asm's proc5 (real source) walks that
+; group's OWN spawn point by relx/rely before the next alien in the
+; group spawns - see alien_spawn_cur_x/y and pas_spawn.
 alien_spawn_table:
- .byte 0,  6, 0, 5, 20,  0      ; patt0  (type 0/entry 6, pattern 0)
- .byte 6,  4, 1, 4, 30,  1      ; patt2  (type 1/entry 9, pattern 1) - real
-                                  ; row is 3 (PATT.asm's y=24 -> 24/8=3),
-                                  ; clamped to 4 for the same reason
-                                  ; patt43's column was clamped below: row
-                                  ; 3 is the score bar, and (like the
-                                  ; column clamp) this alien's own
-                                  ; own-palette erase can't safely share a
-                                  ; cell with static HUD text - see
-                                  ; alien_apply_move's matching floor.
- .byte 37, 4, 2, 16, 20, 25     ; patt43 part 1 (type 2/entry 8, pattern 25)
- .byte 37, 4, 2, 14, 20, 153    ; patt43 part 2 (PATT.asm: EQUB25+&80 -
-                                  ; REFLECTED, unlike part 1 - transcribed
-                                  ; as plain 25 here before, which is why
-                                  ; this half of patt43's spawns kept
-                                  ; sweeping further right instead of
-                                  ; mirroring back onto the screen)
- .byte 36, 6, 0, 5, 20,  128    ; patt1  (type 0, pattern 0 reflected)
- .byte 36, 4, 2, 5, 8,   135    ; patt11 (type 2, pattern 7 reflected)
- .byte 0,  4, 2, 5, 8,   7      ; patt10 (type 2, pattern 7)
+ .byte   0,  6,  0,  5, 20,  0,  0,  5   ; row  0 = patt0
+ .byte  36,  6,  0,  5, 20,128,  0,  5   ; row  1 = patt1
+ .byte   6,  3,  3,  4, 30,  1,  0,  0   ; row  2 = patt2
+ .byte  31,  3,  3,  4, 30,129,  0,  0   ; row  3 = patt3
+ .byte   0, 31,  4, 20,  2,  2, 16,232   ; row  4 = patt4
+ .byte  37, 31,  4, 20,  2,130,240,232   ; row  5 = patt4
+ .byte   3,  5,  6, 50,  4,  4,  0, 16   ; row  6 = patt5
+ .byte   0, 28,  6,  8, 10,  5,  0,  0   ; row  7 = patt6
+ .byte   3, 28,  4,  8, 10,  5,  0,  0   ; row  8 = patt6
+ .byte  36, 28,  6,  8, 10,133,  0,  0   ; row  9 = patt7
+ .byte  33, 28,  4,  8, 10,133,  0,  0   ; row 10 = patt7
+ .byte  18,  4,  4,  6, 15,  6,  0,  0   ; row 11 = patt8
+ .byte  19,  4,  4,  6, 15,134,  0,  0   ; row 12 = patt9
+ .byte   0,  4,  2,  5,  8,  7,  0,  0   ; row 13 = patt10
+ .byte  36,  4,  2,  5,  8,135,  0,  0   ; row 14 = patt11
+ .byte  16,  4,  9,  6, 12,  8,  0,  0   ; row 15 = patt12
+ .byte  20,  4,  9,  6, 12,136,  0,  0   ; row 16 = patt12
+ .byte   0, 16,  0,  6, 16,  9,  0,  0   ; row 17 = patt13
+ .byte  37, 16,  0,  6, 16,137,  0,  0   ; row 18 = patt14
+ .byte   0, 26,  3,  5, 12, 10,  0,  0   ; row 19 = patt15
+ .byte  37, 26,  3,  5, 12,138,  0,  0   ; row 20 = patt16
+ .byte   0,  4,  1,  7, 12, 11,  0,  0   ; row 21 = patt17
+ .byte  37,  4,  1,  7, 12,139,  0,  0   ; row 22 = patt18
+ .byte  24,  4,  2,  5, 10, 13,  0,  0   ; row 23 = patt19
+ .byte  13,  4,  2,  5, 10,141,  0,  0   ; row 24 = patt20
+ .byte   0,  4,  4,  5,  8, 14,  0,  0   ; row 25 = patt21
+ .byte  37,  4,  4,  5,  8,142,  0,  0   ; row 26 = patt22
+ .byte   1, 31,  4,  3, 20, 15,  0,  0   ; row 27 = patt23
+ .byte  36, 31,  4,  3, 20,143,  0,  0   ; row 28 = patt24
+ .byte   3, 31,  2,  3, 16, 16,  0,  0   ; row 29 = patt25
+ .byte  34, 31,  2,  3, 16,144,  0,  0   ; row 30 = patt26
+ .byte   0,  4,  3,  4, 14, 17,  0,  0   ; row 31 = patt27
+ .byte  37,  4,  3,  4, 14,145,  0,  0   ; row 32 = patt28
+ .byte   0,  4,  4,  2, 21, 18,  6,  0   ; row 33 = patt29
+ .byte  37,  4,  4,  2, 21,146,250,  0   ; row 34 = patt30
+ .byte  36,  4, 10,  4, 12, 19,  0,  0   ; row 35 = patt31
+ .byte   0,  4, 10,  4, 12,147,  0,  0   ; row 36 = patt32
+ .byte  37,  4,  3,  8, 20, 20,  0,  0   ; row 37 = patt33
+ .byte  37,  4,  3,  8, 20,148,  0,  0   ; row 38 = patt34
+ .byte  37,  4, 11,  4, 14, 21,  0,  0   ; row 39 = patt35
+ .byte   0,  4, 11,  4, 14,149,  0,  0   ; row 40 = patt36
+ .byte   1,  4,  2,  4, 18, 22,  0,  0   ; row 41 = patt37
+ .byte  36,  4,  2,  4, 18,150,  0,  0   ; row 42 = patt38
+ .byte  37,  4,  4,  5, 12, 23,  0,  0   ; row 43 = patt39
+ .byte  37,  4,  4,  5, 12,151,  0,  0   ; row 44 = patt40
+ .byte   0,  4,  0,  4, 19, 24,  4,  0   ; row 45 = patt41
+ .byte  37,  4,  0,  4, 19,152,252,  0   ; row 46 = patt42
+ .byte  37,  4,  2, 16, 20, 25,  0,  0   ; row 47 = patt43
+ .byte  37,  4,  2, 14, 20,153,  0,  0   ; row 48 = patt43
+ .byte  37,  4,  3,  8, 20, 26,  0,  0   ; row 49 = patt44
+ .byte  37,  4,  3,  8, 20,154,  0,  0   ; row 50 = patt44
+ .byte   0,  5,  5,  1,  1, 29,  0,  0   ; row 51 = patt45
+ .byte   0,  9,  7,  4, 16, 27,  0,  0   ; row 52 = patt45
+ .byte   0, 12,  8,  4, 15, 28,  0,  0   ; row 53 = patt45
 
+; patt_group_row_start/row_count: patt-group-number (0-45, WAVE.asm's
+; own numbering) -> which row(s) of alien_spawn_table above it expands
+; to. Used by init_alien_wave to turn a wave's group-number list
+; (wave_group_list below) into the actual flattened spawn rows.
+patt_group_row_start:
+ .byte 0,1,2,3,4,6,7,9,11,12,13,14,15,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,49,51
+patt_group_row_count:
+ .byte 1,1,1,1,2,1,2,2,1,1,1,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,3
+
+; wave_group_list: all 16 real waves (WAVE.asm's wave0-wave15), each an
+; ordered list of patt-group numbers, straight from source - not
+; reordered or reinterpreted. Fixed 8-byte stride (WAVE_GROUP_STRIDE;
+; the largest real wave, wave15, uses exactly 8), padded with 255
+; (WAVE_GROUP_END) past each wave's real count.
+WAVE_GROUP_STRIDE = 8
+WAVE_GROUP_END = 255
+wave_group_list:
+ .byte 0,2,43,1,11,10,255,255   ; wave0
+ .byte 6,7,6,7,4,255,255,255   ; wave1
+ .byte 5,8,9,13,14,255,255,255   ; wave2
+ .byte 10,11,23,24,2,3,45,255   ; wave3
+ .byte 16,17,18,15,5,27,255,255   ; wave4
+ .byte 6,7,6,7,12,19,20,255   ; wave5
+ .byte 10,11,10,11,2,3,255,255   ; wave6
+ .byte 13,14,21,22,23,24,45,255   ; wave7
+ .byte 4,4,0,1,5,17,18,255   ; wave8
+ .byte 8,9,12,44,2,255,255,255   ; wave9
+ .byte 25,26,15,16,29,255,255,255   ; wave10
+ .byte 27,28,12,37,38,28,45,255   ; wave11
+ .byte 29,30,8,9,31,32,255,255   ; wave12
+ .byte 33,34,15,16,25,26,255,255   ; wave13
+ .byte 23,24,35,36,21,22,255,255   ; wave14
+ .byte 39,40,3,10,11,41,42,45   ; wave15
+
+; --- Real per-wave spawn-group activation, ported directly from
+; ALIENS1.asm's init_new_aliens/init_new_al2/alien2/alien4/alien5/
+; alien6/normal_process and ALIENS2.asm's proc4/proc6/proc5 (the
+; initact/almove/albullact-gated loader), replacing an earlier custom
+; scheme that activated a whole wave's groups at once - which was the
+; actual cause of a wave's aliens all appearing mixed together from the
+; start instead of the real game's strictly sequential one-group-at-a-
+; time reveal (confirmed against a screenshot: wave 1 should show only
+; patt0/1's blue aliens at first, not patt2's magenta ones too).
+pat_st:
+ .res MAXPATT
 alien_spawn_delay_left:
- .res ALIEN_SPAWN_GROUPS
+ .res MAXPATT
 alien_spawn_count_left:
- .res ALIEN_SPAWN_GROUPS
+ .res MAXPATT
+; alien_spawn_cur_x/y: each active slot's OWN current spawn point, in
+; the same raw units as alien_x/alien_y - starts at its row's col*4/
+; row*8 and walks by the row's relx/rely after every individual spawn
+; (see pas_spawn) - NOT the same value as the static table column/row
+; past the group's first spawn. This is what alien_disp_col/row above
+; are really tracking for a freshly spawned alien (raw position / 4 or
+; / 8), same convention as live aliens.
+alien_spawn_cur_x:
+ .res MAXPATT
+alien_spawn_cur_y:
+ .res MAXPATT
+; alien_spawn_row: for each active slot, which alien_spawn_table row it
+; was expanded from - process_alien_spawns/pas_spawn need this to
+; re-read the row's type/pattern/relx/rely/delay-reload fields (only
+; delay/count/cur_x/cur_y get copied out into their own per-slot arrays;
+; everything else is re-read from the master table on demand).
+alien_spawn_row:
+ .res MAXPATT
 
-; init_alien_wave: clears the alien pool and (re)loads the spawn
-; engine's per-group countdowns from alien_spawn_table. Wave-0-only for
-; now - selecting a real wave's own byte list from WAVE.asm instead of
-; this fixed table is later work, once wave advancement means something.
+; init_act/alien_live_count/alien_bullet_live_count: real ALIENS1/2/3.
+; asm and BOMBS2.asm counters (initact/almove/albullact) - see
+; try_load_next_group's header for the exact real increment/decrement
+; sites these mirror, and where each is wired in this port.
+init_act:
+ .byte 0
+alien_live_count:
+ .byte 0
+alien_bullet_live_count:
+ .byte 0
+; wave_base_off/wave_off: real ALIENS1.asm's wavbase/wavoff - wave_off
+; indexes this wave's own slice of wave_group_list (wave_base_off is
+; that slice's start, cached once per wave instead of recomputed from
+; c64_curwave on every call).
+wave_base_off:
+ .byte 0
+wave_off:
+ .byte 0
+
+; init_alien_wave: the one-time per-wave reset - clears the alien pool
+; (erasing any still-drawn aliens first: the debug SPACE key can call
+; this mid-wave with aliens still on screen, which would otherwise leave
+; their bitmap/color cells stuck - "poor cleanup between waves"), the 3
+; real counters, and pat_st, and points wave_off/wave_base_off at the
+; start of this wave's group list. No longer expands any groups itself
+; - try_load_next_group does that now, one real wave-list entry at a
+; time, same as the real ALIENS1.asm.
 init_alien_wave:
     ldx #0
 iaw_clear:
+    lda alien_active,x
+    beq iaw_clear_next
+    jsr erase_alien_x
+iaw_clear_next:
     lda #0
     sta alien_active,x
     inx
     cpx #ALIEN_COUNT
     bne iaw_clear
 
-    ldy #0
-iaw_spawn_init:
-    jsr alien_spawn_table_offset  ; temp1 = group index * 6
-    ldx temp1
-    lda alien_spawn_table+3,x
-    sta alien_spawn_delay_left,y
-    lda alien_spawn_table+4,x
-    sta alien_spawn_count_left,y
-    iny
-    cpy #ALIEN_SPAWN_GROUPS
-    bne iaw_spawn_init
+    ldx #0
+iaw_clear_slots:
+    lda #0
+    sta pat_st,x
+    inx
+    cpx #MAXPATT
+    bne iaw_clear_slots
+
+    lda #0
+    sta init_act
+    sta alien_live_count
+    sta alien_bullet_live_count
+    sta wave_off
+
+    lda c64_curwave
+    and #15
+    asl a
+    asl a
+    asl a
+    sta wave_base_off           ; = wave_index * WAVE_GROUP_STRIDE
     rts
 
-; alien_spawn_table_offset: Y = spawn group index (0-6). Sets temp1 =
-; Y*6 (the table's per-entry stride) - shared by init_alien_wave and
-; process_alien_spawns instead of each recomputing it separately.
-; Preserves Y.
-alien_spawn_table_offset:
-    tya
-    asl a
-    asl a
-    sta temp1               ; temp1 = Y*4
-    tya
-    asl a
+iaw_row_start:
+ .byte 0
+iaw_row_count:
+ .byte 0
+iaw_row:
+ .byte 0
+; try_load_next_group: real init_new_aliens/init_new_al2, called once
+; per frame from game_loop (same cadence as the real main_loop's own
+; "JSRinit_new_aliens"). Only loads the wave's NEXT group-list entry
+; once init_act/alien_live_count/alien_bullet_live_count are ALL zero
+; (real "LDAinitact:ORAalmove:ORAalbullact:BNEalien1") - every alien and
+; bullet from the CURRENT group must be completely gone before the next
+; group even starts spawning. This strict sequencing (not a bounded
+; "N concurrent groups" scheme - MAXPATT=4 is just how many sub-records
+; one wave-list entry can have, patt45's max) is what makes a wave's
+; opening show only one alien type/color at a time, not several mixed
+; together. Reaching the wave's WAVE_GROUP_END terminator here (real:
+; the wave-list byte having bit7 set) advances to the next wave - there
+; is no separate "check_wave_clear" in the real source, wave completion
+; is just what this gate naturally does once the list is exhausted.
+try_load_next_group:
+    lda init_act
+    ora alien_live_count
+    ora alien_bullet_live_count
+    bne tlng_done
+
+    ldx wave_off
+    cpx #WAVE_GROUP_STRIDE
+    beq tlng_wave_done
+    lda wave_base_off
     clc
-    adc temp1
-    sta temp1                ; temp1 = Y*2 + Y*4 = Y*6
+    adc wave_off
+    tax
+    lda wave_group_list,x
+    cmp #WAVE_GROUP_END
+    beq tlng_wave_done
+    tax
+    lda patt_group_row_start,x
+    sta iaw_row_start
+    lda patt_group_row_count,x
+    sta iaw_row_count
+    inc wave_off
+
+    lda #0
+    sta iaw_row
+tlng_row_loop:
+    lda iaw_row
+    cmp iaw_row_count
+    beq tlng_done
+
+    ldx #0                    ; real alien5's free-slot scan
+tlng_find_slot:
+    lda pat_st,x
+    beq tlng_slot_found
+    inx
+    cpx #MAXPATT
+    bne tlng_find_slot
+    rts                       ; no free slot - real behavior just stops
+                               ; trying for this call, retried next frame
+tlng_slot_found:
+    lda iaw_row_start
+    clc
+    adc iaw_row
+    sta alien_spawn_row,x
+    jsr iaw_row_to_offset      ; temp1 = row*8
+    ldy temp1
+    lda alien_spawn_table+3,y
+    sta alien_spawn_delay_left,x
+    lda alien_spawn_table+4,y
+    sta alien_spawn_count_left,x
+    lda alien_spawn_table+0,y
+    asl a
+    asl a
+    sta alien_spawn_cur_x,x
+    lda alien_spawn_table+1,y
+    asl a
+    asl a
+    asl a
+    sta alien_spawn_cur_y,x
+    lda #1
+    sta pat_st,x
+    inc init_act
+
+    inc iaw_row
+    jmp tlng_row_loop
+tlng_wave_done:
+    jsr advance_to_next_wave
+tlng_done:
     rts
 
-; process_alien_spawns: called once per frame (no throttle - delay
-; values are real per-frame BBC countdowns, not something to slow
-; further). For each spawn group with any spawns left: counts its delay
-; down, and on reaching 0, spawns one alien into the first free pool
-; slot (dropping the spawn if the pool's full) and reloads the delay.
-pas_group:
+iaw_row_to_offset:               ; A = master row index -> temp1 = A*8
+    asl a
+    asl a
+    asl a
+    sta temp1
+    rts
+
+; process_alien_spawns: called once per frame. For each OCCUPIED
+; pat_st slot: counts its delay down, and on reaching 0, spawns one
+; alien into the first free pool slot (dropping the spawn if the pool's
+; full) and reloads the delay - real ALIENS2.asm's proc1/proc6/proc4/
+; proc5. On the slot's count_left reaching 0 (all its real spawns
+; done), frees pat_st and decrements init_act (real proc4's "DECinitnum,
+; X:BNEproc5 / LDA#0:STAinitst,X:DECinitact") - this is what lets
+; try_load_next_group's gate eventually open again.
+pas_slot:
  .byte 0
 
 process_alien_spawns:
     lda #0
-    sta pas_group
+    sta pas_slot
 pas_loop:
-    ldy pas_group
+    ldy pas_slot
+    lda pat_st,y
+    bne pas_active
+    jmp pas_next
+pas_active:
     lda alien_spawn_count_left,y
-    beq pas_next
+    bne pas_has_count
+    jmp pas_next
+pas_has_count:
     lda alien_spawn_delay_left,y   ; DEC has no absolute,Y mode - do it
     sec                             ; as a plain load/subtract/store
     sbc #1
     sta alien_spawn_delay_left,y
-    bne pas_next
+    beq pas_delay_done
+    jmp pas_next                    ; out of branch range - see pas_next
+                                      ; itself for the same pattern
+pas_delay_done:
 
-    jsr alien_spawn_table_offset   ; temp1 = group offset (Y*6)
+    lda alien_spawn_row,y           ; this active slot's master row
+    jsr iaw_row_to_offset           ; temp1 = row*8
     ldx temp1
     lda alien_spawn_table+3,x
     sta alien_spawn_delay_left,y
@@ -1993,6 +2346,11 @@ pas_loop:
     sec
     sbc #1
     sta alien_spawn_count_left,y
+    bne pas_spawn_one
+    lda #0                          ; this slot's real spawns are all
+    sta pat_st,y                    ; done - free it and let
+    dec init_act                    ; try_load_next_group's gate see it
+pas_spawn_one:
 
     ldx #0
 pas_find_slot:
@@ -2005,19 +2363,25 @@ pas_find_slot:
 pas_spawn:
     lda #1
     sta alien_active,x
-    ldy temp1
-    lda alien_spawn_table+0,y
-    sta alien_disp_col,x
-    asl a
-    asl a
-    sta alien_x,x            ; alien_x = col*4 (color-pixels)
-    lda alien_spawn_table+1,y
-    sta alien_disp_row,x
-    asl a
-    asl a
-    asl a
-    sta alien_y,x            ; alien_y = row*8 (scanlines)
-    lda alien_spawn_table+2,y
+    inc alien_live_count
+
+    ldy pas_slot
+    lda alien_spawn_cur_x,y   ; this group's CURRENT walking spawn point,
+    sta alien_x,x              ; not the table's static base - already raw
+    lsr a                      ; color-pixels, so no more *4 here (see
+    lsr a                      ; alien_spawn_cur_x's own header)
+    sta alien_disp_col,x        ; rendered cell = raw x / 4
+    lda alien_spawn_cur_y,y
+    sta alien_y,x
+    lsr a
+    lsr a
+    lsr a
+    tay
+    lda row_scale_table,y
+    sta alien_disp_row,x        ; rendered cell = scaled real row
+
+    ldy temp1                  ; back to the table's group*8 offset for
+    lda alien_spawn_table+2,y  ; the fields that don't walk (type/pattern)
     sta alien_type,x
     jsr init_alien_hp
     lda #0
@@ -2025,61 +2389,66 @@ pas_spawn:
                               ; alien's first tick, not a move first
     lda alien_spawn_table+5,y
     jsr alien_select_pattern
+
+    ; Walk this group's own spawn point by (relx,rely) for the NEXT
+    ; spawn from this same record - real BBC (ALIENS2.asm's proc5) does
+    ; this after every single spawn, unconditionally. Y was clobbered by
+    ; alien_select_pattern above (it uses Y itself) - reload temp1, the
+    ; table offset is still valid there. length is free scratch (no jsr
+    ; between this and its use).
+    ldy temp1
+    lda alien_spawn_table+7,y   ; rely
+    sta length
+    lda alien_spawn_table+6,y   ; relx
+    ldy pas_slot
+    clc
+    adc alien_spawn_cur_x,y
+    jsr wrap_x_margin
+    sta alien_spawn_cur_x,y
+    lda alien_spawn_cur_y,y
+    clc
+    adc length
+    sta alien_spawn_cur_y,y
+
     jsr draw_alien_x
 pas_next:
-    inc pas_group
-    lda pas_group
-    cmp #ALIEN_SPAWN_GROUPS
-    bne pas_loop
+    inc pas_slot
+    lda pas_slot
+    cmp #MAXPATT
+    beq pas_done
+    jmp pas_loop
+pas_done:
     rts
 
-; c64_curwave: advances every time the current wave's spawn groups are all
-; exhausted AND the pool is empty (checked by check_wave_clear, called
-; once per game_loop frame). There's still only one real spawn table
-; (wave 0's, decoded from PATT.asm/WAVE.asm - see alien_spawn_table)
-; - decoding the rest of WAVE.asm's per-wave byte lists into their own
-; tables is later work, same as init_alien_wave's own header note - so
-; this reloads the SAME table for now. level_ones (the flag count)
-; tracks it 1:1, capped at 8 so the flag row can't run off the right
-; edge; draw_level_flags only ever needs to draw NEW flags further right
-; (never clear old ones - see redraw_lives_after_loss for the opposite,
-; shrinking case), so no erase is needed here.
+; c64_curwave: advances once try_load_next_group's gate opens with the
+; wave's group list exhausted (its own real WAVE_GROUP_END check, no
+; separate "check_wave_clear" needed - see that routine's header).
+; c64_curwave itself increments unboundedly, matching ALIENS1.asm's own
+; "INCcurwave" - the wraparound (mod 16) only happens where it's used
+; to index wave_group_list, in init_alien_wave, matching the real
+; source's own "AND#15" at that same point. level_ones (the displayed
+; level number) tracks it 1:1, uncapped now that draw_level_flags does
+; the real x10/x5/x1 tally instead of one icon per level.
 c64_curwave:
  .byte 0
 
-check_wave_clear:
-    ldy #0
-cwc_groups:
-    lda alien_spawn_count_left,y
-    bne cwc_done
-    iny
-    cpy #ALIEN_SPAWN_GROUPS
-    bne cwc_groups
-
-    ldx #0
-cwc_aliens:
-    lda alien_active,x
-    bne cwc_done
-    inx
-    cpx #ALIEN_COUNT
-    bne cwc_aliens
-
+; advance_to_next_wave: the actual wave-advance body (c64_curwave++,
+; Zone tune, flag-count update, reset for the new wave) - called by
+; try_load_next_group (the real trigger) and by gl_force_next_wave (a
+; TEMPORARY debug key, see game_loop, to reach waves 1-15 for testing
+; without waiting out a full wave 0).
+advance_to_next_wave:
     inc c64_curwave
     lda #1                      ; tune 1 = Zone/wave music
     jsr start_tune
-    lda level_ones
-    cmp #8
-    bcs cwc_advance
     inc level_ones
     jsr draw_level_flags
-cwc_advance:
     jsr init_alien_wave
-cwc_done:
     rts
 
-; --- Alien flight patterns (phase 5b): a real interpreter for
-; ALIENS3.asm/ALIENS4.asm's pattern bytecode, not the phase 5a
-; placeholder drift. Traced end to end against the source:
+; --- Alien flight patterns: a real interpreter for ALIENS3.asm/
+; ALIENS4.asm's pattern bytecode (an earlier pass used simple placeholder
+; drift instead, before this was traced end to end against the source):
 ;
 ; Each pattern (c64_patdat0-29, PATDAT.asm) is a byte stream read one
 ; instruction at a time (alien_pat_off). A byte with bit7 SET is a
@@ -2130,12 +2499,10 @@ addrely_tab:
 flip_table_net:
  .byte 0,3,2,1,7,6,5,4
 
-; c64_patdat0/1/7/25: the 4 real flight patterns wave 0 actually uses
-; (decoded above). pattern_table_lo/hi (further below) is a 30-entry
-; table matching vecpatdl/vecpatdh's real size, but only indices 0, 1,
-; 7 and 25 are decoded - everything else falls back to c64_patdat0 (a real,
-; working pattern, not fabricated data) until more waves are added and
-; need their own.
+; c64_patdat0-29: all 30 real flight patterns (PATDAT.asm's patdat0-29),
+; matching vecpatdl/vecpatdh's real 30-entry size - every pattern any
+; of the 16 real waves can select is real, decoded data now, not a
+; fallback.
 c64_patdat0:
  .byte $86,9,$83,12,10,1,$86,13,$86,12,12,$83,13,6
 c64_patdat1:
@@ -2144,17 +2511,75 @@ c64_patdat7:
  .byte $93,13,$88,9,$82,4,$87,7,$86,15,$87,23,6
 c64_patdat25:
  .byte $90,2,$83,9,$a0,2,$8d,48,6
+c64_patdat2:
+ .byte $88,12,$88,15,$88,12,10,100,$84,1,4,3,$84,3,12,6
+c64_patdat3:
+ .byte $88,9,$83,10,$88,11,$83,10,0,0
+c64_patdat4:
+ .byte 10,2,$87,9,4,12,12,$87,9,$87,11,10,2,4,12,$87,11,12,0,0
+c64_patdat5:
+ .byte $8d,12,$88,0,$84,3,$88,6,$88,5,$8d,20,6
+c64_patdat6:
+ .byte $84,18,$85,9,$86,18,$88,9,$85,18,$86,9,6
+c64_patdat8:
+ .byte $88,10,$84,21,$86,10,$84,5,$82,1,$84,4,$88,12,$84,8,$8b,15,6
+c64_patdat9:
+ .byte $85,9,$85,12,$85,8,$85,7,$85,3,$87,6,$86,2,$8e,13,$89,17,$8a,13,6
+c64_patdat10:
+ .byte $83,20,$83,24,$84,16,$84,8,$84,4,$84,1,$82,9,$88,5,$8a,13,$87,21,$85,10,6
+c64_patdat11:
+ .byte $86,13,$84,5,$85,9,$86,52,$89,9,$89,49,$84,10,$84,14,$85,54,$87,11,$93,51,6
+c64_patdat12:
+ .byte $88,6,$85,1,$8f,5,$8f,6,$88,5,$85,3,0,0
+c64_patdat13:
+ .byte $88,14,$85,54,$85,11,$84,51,$85,8,$85,52,$83,9,$87,13,$85,21,$87,29,6
+c64_patdat14:
+ .byte 10,1,$8c,13,$83,49,$82,9,$82,52,$81,11,$82,48,$81,8,$82,55,$82,15,$83,11,$82,54,$81,14,$82,50,$82,53,12,$87,13,6
+c64_patdat15:
+ .byte $87,16,$85,48,$83,12,$85,52,$86,17,$85,49,$83,13,$85,53,$88,18,6
+c64_patdat16:
+ .byte $8d,48,$82,52,$82,9,$82,49,$82,13,$82,53,$82,10,$82,50,$82,14,$82,54,$82,11,$82,51,$82,15,$82,55,$82,8,$82,48,$82,12,$82,52,$82,9,$82,49,$8e,53,6
+c64_patdat17:
+ .byte $8d,21,$83,49,$84,9,$85,12,$84,8,$83,15,$83,23,$84,15,$83,11,$84,14,$83,22,$83,14,$84,10,$85,13,$84,9,$83,52,$8d,20,$82,8,6
+c64_patdat18:
+ .byte $86,13,$86,14,0,0
+c64_patdat19:
+ .byte 10,3,$83,18,$81,50,12,$85,54,$84,11,$96,$40,10,1,$85,15,$84,8,$84,12,$83,52,$83,9,$83,13,$83,10,$83,14,$84,54,$88,11,12,$83,15,$84,55,$8c,8,6
+c64_patdat20:
+ .byte $8c,10,10,3,$81,$40,8,$81,$40,12,$89,20,6
+c64_patdat21:
+ .byte $94,14,$84,54,$85,11,$83,15,$83,55,$84,8,$82,48,$84,12,$82,52,$8c,9,$84,49,$83,13,$83,53,$83,10,$83,50,$84,14,$83,54,$86,19,$84,51,$86,19,6
+c64_patdat22:
+ .byte $87,18,$85,53,$83,13,$85,49,$86,17,$85,52,$83,12,$85,48,$88,16,6
+c64_patdat23:
+ .byte $9d,5,$86,9,$9d,6,$86,11,0,0
+c64_patdat24:
+ .byte $82,10,$83,13,$8d,49,$83,13,$82,10,$83,14,$8d,54,$83,14,0,0
+c64_patdat26:
+ .byte $a5,5,$90,6,$84,1,$90,4,$a8,7,6
+; c64_patdat27/28: PATDAT.asm's patdat27 has NO terminator of its own -
+; the real source's patdat28 label sits immediately after patdat27's
+; last byte, so patdat27's own stream legitimately runs on into
+; patdat28's bytes (a real, shared-tail quirk in the source, not a
+; mistake - preserved here by simply not putting anything between the
+; two labels, same as the source's own layout).
+c64_patdat27:
+ .byte $a4,9,$83,10,$a4,11
+c64_patdat28:
+ .byte $83,10,$a4,9,$83,10,$a4,11,14,2,27
+c64_patdat29:
+ .byte $c5,1,$c5,3,0,0
 
 pattern_table_lo:
- .byte <c64_patdat0,<c64_patdat1,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat7
- .byte <c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0
- .byte <c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0
- .byte <c64_patdat0,<c64_patdat25,<c64_patdat0,<c64_patdat0,<c64_patdat0,<c64_patdat0
+ .byte <c64_patdat0,<c64_patdat1,<c64_patdat2,<c64_patdat3,<c64_patdat4,<c64_patdat5,<c64_patdat6,<c64_patdat7
+ .byte <c64_patdat8,<c64_patdat9,<c64_patdat10,<c64_patdat11,<c64_patdat12,<c64_patdat13,<c64_patdat14,<c64_patdat15
+ .byte <c64_patdat16,<c64_patdat17,<c64_patdat18,<c64_patdat19,<c64_patdat20,<c64_patdat21,<c64_patdat22,<c64_patdat23
+ .byte <c64_patdat24,<c64_patdat25,<c64_patdat26,<c64_patdat27,<c64_patdat28,<c64_patdat29
 pattern_table_hi:
- .byte >c64_patdat0,>c64_patdat1,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat7
- .byte >c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0
- .byte >c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0
- .byte >c64_patdat0,>c64_patdat25,>c64_patdat0,>c64_patdat0,>c64_patdat0,>c64_patdat0
+ .byte >c64_patdat0,>c64_patdat1,>c64_patdat2,>c64_patdat3,>c64_patdat4,>c64_patdat5,>c64_patdat6,>c64_patdat7
+ .byte >c64_patdat8,>c64_patdat9,>c64_patdat10,>c64_patdat11,>c64_patdat12,>c64_patdat13,>c64_patdat14,>c64_patdat15
+ .byte >c64_patdat16,>c64_patdat17,>c64_patdat18,>c64_patdat19,>c64_patdat20,>c64_patdat21,>c64_patdat22,>c64_patdat23
+ .byte >c64_patdat24,>c64_patdat25,>c64_patdat26,>c64_patdat27,>c64_patdat28,>c64_patdat29
 
 ; alien_select_pattern: X = alien slot, A = pattern selector (bit7 =
 ; reflect, bits0-6 = pattern_table index). Points alien_pat_lo/hi,X at
@@ -2226,6 +2651,20 @@ aei_direction:
     and #$7F
     sta alien_mult,x
     jsr alien_read_byte
+    ; Safety clamp: addrelx_tab/addrely_tab only have 56 real entries
+    ; (0-55, verified against ROUT1.asm's actual .addrelx/.addrely
+    ; data). c64_patdat19 (real src/PATDAT.asm - "EQUB&96:EQUB&40")
+    ; contains a direction byte of 64, past the end of the real BBC's
+    ; own table too - a genuine bug in the original 1986 data, not a
+    ; transcription guess (reachable in play via patt31/32, wave 12+).
+    ; Rather than silently invent a "correct" replacement value, the
+    ; byte is kept exactly as the source has it, and just clamped here
+    ; so an out-of-range direction can't read past our own tables into
+    ; whatever data happens to follow.
+    cmp #56
+    bcc aei_dir_in_range
+    lda #55
+aei_dir_in_range:
     ldy alien_pat_reflect,x
     bpl aei_not_reflected
     cmp #48
@@ -2322,6 +2761,7 @@ afb_find_slot:
 afb_spawn:
     lda #1
     sta alien_bullet_active,x
+    inc alien_bullet_live_count
     lda afb_target_row
     sta alien_bullet_row,x
     lda afb_target_col
@@ -2334,6 +2774,7 @@ afb_drop:
 aei_die:
     lda #0
     sta alien_active,x
+    dec alien_live_count
     jsr erase_alien_x
     rts
 
@@ -2360,11 +2801,11 @@ aei_mve:
 ; alien_spawn_child: X = parent alien slot (preserved), A = child's
 ; pattern selector byte. Finds a free pool slot and spawns a child
 ; there: parent's type, a position 8 scanlines below the parent
-; (matches ALIENS4.asm's "LDAaly,X:ADC#8"), the given pattern.
-; Simplified from the source's exact graphic-randomization/alien_hits
-; bookkeeping (collision/scoring infrastructure this port doesn't have
-; yet), but the spawn itself - position, pattern, a live pool slot - is
-; real, not a placeholder.
+; (matches ALIENS4.asm's "LDAaly,X:ADC#8"), the given pattern, and a
+; fresh alien_hp/alien_score via init_alien_hp - same as any other
+; spawn. Simplified only in that it skips the source's own graphic-
+; randomization step (DAT_NEWALIEN isn't reached by any of wave 0's 4
+; real patterns, so this has never actually been exercised in play).
 asc_pattern:
  .byte 0
 asc_parent:
@@ -2385,6 +2826,7 @@ asc_find_slot:
 asc_spawn:
     lda #1
     sta alien_active,x
+    inc alien_live_count
     ldy asc_parent
     lda alien_type,y
     sta alien_type,x
@@ -2395,17 +2837,18 @@ asc_spawn:
     sta alien_disp_col,x
     lda alien_y,y
     clc
-    adc #8
-    cmp #185                  ; same footprint-aware bound as
-    bcc asc_y_ok               ; alien_apply_move - clamp rather than
-    lda #184                    ; deactivate here, a freshly-spawned
-asc_y_ok:                        ; child has nothing to deactivate FROM
-    sta alien_y,x
+    adc #8                    ; real ALIENS4.asm's dat_newalien: "LDAaly,
+    sta alien_y,x               ; X:ADC#8:STAaly,Y" - no clamp in the
+                                  ; source, and none needed now that Y is
+                                  ; unbounded (see row_scale_table)
     lsr a
     lsr a
     lsr a
-    sta alien_disp_row,x      ; derived from the real (post-clamp) Y,
-                               ; not copied from the parent's own row
+    tay
+    lda row_scale_table,y
+    sta alien_disp_row,x      ; derived from the real Y (scaled for
+                               ; display), not copied from the parent's
+                               ; own already-scaled disp_row
     lda #0
     sta alien_mult,x
     lda asc_pattern
@@ -2433,6 +2876,37 @@ ard_new_col:
 ard_new_row:
  .byte 0
 
+; row_scale_table: real BBC row (0-31, alien_y/8 - the BBC screen is
+; 256 scanlines/32 rows tall, confirmed against ROUT1.asm's own
+; line_start/line_starth, 32 entries) -> our displayable row (0-24, our
+; screen is 200 scanlines/25 rows). A straight clamp (deactivating an
+; alien once its row left a fixed safe band) was a design decision that
+; was never checked - real Y is unbounded on the BBC, and forcing a
+; kill instead of just scaling the position was inventing behavior, not
+; porting it. This scales instead, but the boundary needs care: real
+; xycalc's "CPY#23" guard only protects scanlines 0-22 (partway through
+; real row 2), so real row 3 is fully valid on the BBC - but is_row_
+; protected reserves ALL of OUR row 3 for the score bar, a whole row
+; more than the real guard does. An earlier version of this table
+; mapped real row 3 straight to our row 3, which let aliens legitimately
+; occupying a valid real position draw straight into the score bar -
+; the actual cause of score corruption appearing right at wave start
+; (patt2/patt3 both spawn at real row 3). Fixed: real rows 3-29 (27
+; rows, the real usable band) now scale onto our rows 4-22 (19 rows,
+; our actual safe band, matching the row-4 floor already established
+; elsewhere) - not 3-22. Rows 30-31 (both screens' bottom HUD, verified
+; via flagson's addres/addres1 matching line_start[30]/[31] exactly)
+; still map 1:1 to our 23-24. Real rows 0-2 never occur in any actual
+; spawn/movement data (verified - nothing in alien_spawn_table goes
+; below real row 3) so their exact mapping doesn't matter in practice;
+; kept as identity just so the table has no entry that could be unsafe
+; if that ever changes. Used both here and at spawn (pas_spawn) -
+; alien_y/alien_spawn_cur_y always hold the real, unscaled scanline
+; position; only the DISPLAY row goes through this table.
+row_scale_table:
+ .byte 0,1,2,4,5,5,6,7,7,8,9,10,10,11,12,12
+ .byte 13,14,14,15,16,16,17,18,19,19,20,21,21,22,23,24
+
 alien_refresh_display:
     lda alien_x,x
     lsr a
@@ -2442,6 +2916,8 @@ alien_refresh_display:
     lsr a
     lsr a
     lsr a
+    tay
+    lda row_scale_table,y
     sta ard_new_row
 
     lda ard_new_col
@@ -2460,21 +2936,37 @@ ard_redraw:
 ard_done:
     rts
 
+; wrap_x_margin: A = a walking/live alien x position that may have grown
+; past ALIEN_MAX_X (149) - the same safe right-edge margin
+; SHIP_MAX_COL/the lives icons already use, not the real BBC's literal
+; screen edge (160). Wraps by repeated subtraction, exactly mirroring
+; ALIENS3.asm's check_x_wrap/ALIENS2.asm's chk_xinit_wrap loops (real
+; BBC wraps at 80 BBC-byte-columns = our 160 raw units; wrapping at the
+; full 160 here would let a 12px-wide alien's footprint poke past
+; column 39 into the next row's flat screen-matrix/bitmap memory - the
+; exact class of corruption alien_apply_move's Y floor below already
+; had to fix once). Returns the wrapped value in A.
+wrap_x_margin:
+    cmp #ALIEN_MAX_X
+    bcc wxm_done
+    sec
+    sbc #ALIEN_MAX_X
+    jmp wrap_x_margin
+wxm_done:
+    rts
+
 ; alien_apply_move: X = alien slot. Applies one compass step
-; (addrelx_tab/addrely_tab[alien_direct,X]) to alien_x/alien_y,
-; deactivating if it would go off any edge - the source instead wraps X
-; and lets Y wander indefinitely; deactivating here is a deliberate
-; simplification (there's no collision/scoring system yet to make
-; "wrap around forever" meaningful), not a guess at the source's own
-; behavior.
-; Bounds are the screen size MINUS the alien's own 12x16-pixel
-; footprint (149/185, not 160/200) - checking against the full screen
-; size let alien_x/alien_y reach positions whose 3x2-cell footprint
-; ran past column 39 or row 24, wrapping into the next row's bitmap/
-; screen-matrix/color-RAM data (the buffers are flat arrays, so
-; "column 40" is really the start of the next row) - that's what showed
-; up as heavy on-screen corruption. 148/184 are the same max col/row
-; (37/23) SHIP_MAX_COL/SHIP_MAX_ROW already use, for the same reason.
+; (addrelx_tab/addrely_tab[alien_direct,X]) to alien_x/alien_y. Neither
+; axis ever kills the alien now - X wraps around the screen
+; (wrap_x_margin) matching ALIENS3.asm's real check_x_wrap, and Y just
+; accumulates as a plain 8-bit value, wrapping at 256 the same way the
+; real aly byte would on real hardware ("Y wanders indefinitely" -
+; ALIENS3.asm never bounds-checks it either). alien_y/alien_spawn_cur_y
+; hold this real, unscaled position - only alien_refresh_display (and
+; pas_spawn, at first draw) convert it to a displayable row, via
+; row_scale_table. See that table's own header for why a fixed
+; deactivate-at-row-23 floor/ceiling was replaced with real-time
+; scaling instead.
 ;
 ; Decrements alien_mult,X itself (matching move4's "LDXprocst:
 ; DECalmult,X", which runs on EVERY call including the one right after
@@ -2488,35 +2980,14 @@ alien_apply_move:
     lda alien_x,x
     clc
     adc addrelx_tab,y
-    cmp #149
-    bcs aam_deactivate
+    jsr wrap_x_margin
     sta alien_x,x
     lda alien_y,x
     clc
-    adc addrely_tab,y
-    cmp #176                 ; keeps the alien's bottom row off row 23
-    bcs aam_deactivate         ; (the flags/lives HUD) - also catches
-    cmp #32                    ; the "went negative" wraparound, which
-    bcc aam_deactivate          ; comes back as a large value (>=176).
-    sta alien_y,x              ; Floor raised from row 1 (Y>=8) to row 4
-                                 ; (Y>=32): row 1-3 still let an alien's
-                                 ; TOP overlap row 0-2, but its erase on
-                                 ; the way back out has no idea a score-
-                                 ; bar letter lives there (is_cell_covered
-                                 ; only knows about other hard objects,
-                                 ; not static text) and would reset those
-                                 ; cells to plain background, permanently
-                                 ; wiping part of the score bar - the
-                                 ; actual cause of the score-corruption
-                                 ; reports surviving the star-row fix.
-                                 ; "status area" is both ends, not just
-                                 ; the bottom.
+    adc addrely_tab,y          ; wraps mod 256 via plain 8-bit overflow -
+    sta alien_y,x                ; no clamp/deactivate needed, matches
+                                   ; real aly's own unbounded behavior
     jmp alien_refresh_display
-aam_deactivate:
-    lda #0
-    sta alien_active,x
-    jsr erase_alien_x
-    rts
 
 ; alien_tick_one: X = alien slot (already confirmed active by the
 ; caller). If alien_mult,X is still counting down, just applies the
@@ -2543,14 +3014,19 @@ atx_read:
 atx_done:
     rts
 
-; alien_move_tick: called once per frame per active alien (throttled -
-; the pattern magnitudes are tuned to the source's own frame-rate
-; assumptions, and this is the closest we track to that). Named
-; alien_move_tick rather than move_aliens - ALIENS3.asm (still-
-; unconverted legacy source, assembled but not called) already defines
-; .move_aliens, and this file's ca65 build shares one global symbol
-; namespace with it.
-ALIEN_MOVE_SLOWDOWN = 6
+; alien_move_tick: called once per frame per active alien. The real
+; BBC's own move_the_aliens processes CONST.asm's `process` (6) aliens
+; per real frame, round-robin across up to maxaliens=40 - so any given
+; alien ticks roughly once every 40/6 (~6.7) real frames when the pool
+; is near-full, which is where the old ALIEN_MOVE_SLOWDOWN=6 throttle
+; here came from. But our own pool is only ALIEN_COUNT=8 - with that
+; few aliens, the real round-robin cursor wraps back around (and
+; re-ticks the same aliens) almost every single frame, not every 6th,
+; so 6x was a mismatch. Running everything (this + the two bullet
+; throttles) at a real, untouched 1x turned out too fast once combined,
+; though - so this keeps the same reserved 2x speed budget as
+; BULLET_MOVE_SLOWDOWN, not a return to the old 6x mismatch.
+ALIEN_MOVE_SLOWDOWN = 2
 alien_move_count:
  .byte 0
 
@@ -3070,6 +3546,7 @@ sc_clear_aliens:
     lda #0
     sta alien_active,x
     sta alien_exploding,x
+    dec alien_live_count
 sc_ca_next:
     inx
     cpx #ALIEN_COUNT
@@ -3079,7 +3556,19 @@ sc_ca_next:
 sc_clear_bullets:
     lda bullet_active,x
     beq sc_cb_next
+    ; Same protected-row guard move_bullets uses: draw_bullet_x XOR-
+    ; erases, but a bullet caught mid-transit through row 3/23/24 was
+    ; never actually drawn there (move_bullets already skips it) - erase
+    ; it unconditionally here and the XOR toggle bakes a bullet-shaped
+    ; hole into the score bar/flags instead of removing it. This was
+    ; the real "leftover bullet on screen" bug.
+    lda bullet_row,x
+    sta temp1
+    jsr is_row_protected
+    lda star_row_protected
+    bne sc_cb_deactivate
     jsr draw_bullet_x
+sc_cb_deactivate:
     lda #0
     sta bullet_active,x
 sc_cb_next:
@@ -3091,9 +3580,16 @@ sc_cb_next:
 sc_clear_abullets:
     lda alien_bullet_active,x
     beq sc_cab_next
+    lda alien_bullet_row,x
+    sta temp1
+    jsr is_row_protected
+    lda star_row_protected
+    bne sc_cab_deactivate
     jsr draw_alien_bullet_x
+sc_cab_deactivate:
     lda #0
     sta alien_bullet_active,x
+    dec alien_bullet_live_count
 sc_cab_next:
     inx
     cpx #ALIEN_BULLET_COUNT
@@ -3270,6 +3766,7 @@ cabs_loop:
     jsr draw_alien_bullet_x
     lda #0
     sta alien_bullet_active,x
+    dec alien_bullet_live_count
     jsr ship_crash
     rts
 cabs_next:
@@ -3916,43 +4413,171 @@ mt_playing:
 ;   . R M M . . . .
 ;   . R M . . . . .
 ;   . R . . . . . .   (x6 rows - bare pole)
-; This game has no wave/level advancement yet (no aliens, no scoring),
-; so level_ones is just a fixed placeholder for now and the x10/x5
-; batch icons - needed once a level can reach 10 - aren't decoded yet;
-; nothing here can exercise them until that exists.
+; level_ones: the real, uncapped displayed level number (c64_curwave+1),
+; incremented each time a wave clears - see advance_to_next_wave.
 level_ones:
  .byte 1
 
-; draw_level_flags: draws level_ones (0-9) individual "x1" flags side by
-; side from the left edge (cols 0,2,4,...), 2 cells each.
+; FLAG_MAX_ICONS: how many 2-cell icon slots draw_level_flags will ever
+; touch (cols 0,2,4,...) - real headroom before the row would reach
+; LIVES_RIGHT_COL=38's icons; a level needing more than this many icons
+; even after real x10/x5 batching (i.e. 140+) just clips, the same
+; practical limit the original 40-column screen would have faced too.
+FLAG_MAX_ICONS = 14
+dlf_tens:
+ .byte 0
+dlf_five:
+ .byte 0
+dlf_ones:
+ .byte 0
+dlf_slot:
+ .byte 0
+
+; draw_level_flags: real FLAGS.asm tally (flagson's flag0/flag1/flag2
+; dispatch, traced from src/FLAGS.asm) - decomposes level_ones into as
+; many x10 icons as fit, then at most one x5, then the remainder as x1
+; icons, NOT one icon per level (which is what this used to do, capped
+; at 8 specifically because nothing past "8 individual flags" could
+; look right without the real x10/x5 graphics). Always redraws every
+; slot up to FLAG_MAX_ICONS (icon or blank) rather than only ever
+; appending, because the composition can change in ways that aren't a
+; simple append - e.g. level 9 (nine x1 icons) -> level 10 (one x10
+; icon) replaces the whole row, it doesn't grow it. Real BBC's own
+; flagson never erases (XOR-only) - not replicated here since our own-
+; palette draw can just redraw cleanly instead of needing that trick.
 draw_level_flags:
-    lda level_ones
-    beq dlf_done
-    sta length              ; length = remaining count (scratch)
     lda #0
-    sta temp1                ; temp1 = flag index (scratch) - see the
-                              ; save/restore below; draw_one_flag also
-                              ; uses temp1, for its own purpose (column)
-dlf_loop:
-    lda temp1
+    sta dlf_tens
+    lda level_ones
+dlf_div10:
+    cmp #10
+    bcc dlf_div10_done
+    sec
+    sbc #10
+    inc dlf_tens
+    jmp dlf_div10
+dlf_div10_done:
+    sta dlf_ones              ; dlf_ones = level_ones mod 10 (0-9), temp
+
+    lda #0
+    sta dlf_five
+    lda dlf_ones
+    cmp #5
+    bcc dlf_fives_done         ; <5: no x5 icon, dlf_ones (0-4) stands
+    sbc #5                      ; carry already set by the cmp above
+    sta dlf_ones                ; dlf_ones = remainder-5 (0-4)
+    lda #1
+    sta dlf_five
+dlf_fives_done:
+
+    lda #0
+    sta dlf_slot
+dlf_slot_loop:
+    lda dlf_slot
+    cmp #FLAG_MAX_ICONS
+    beq dlf_done
+    asl a                    ; A = column = slot*2
     pha
-    asl a
-    jsr draw_one_flag
+
+    lda dlf_slot
+    cmp dlf_tens
+    bcs dlf_try_five
     pla
-    clc
-    adc #1
-    sta temp1
-    dec length
-    bne dlf_loop
+    jsr draw_one_flag10
+    jmp dlf_slot_next
+
+dlf_try_five:
+    sec
+    sbc dlf_tens
+    cmp dlf_five
+    bcs dlf_try_ones
+    pla
+    jsr draw_one_flag5
+    jmp dlf_slot_next
+
+dlf_try_ones:
+    sec
+    sbc dlf_five
+    cmp dlf_ones
+    bcs dlf_blank
+    pla
+    jsr draw_one_flag
+    jmp dlf_slot_next
+
+dlf_blank:
+    pla
+    jsr erase_flag_cell
+dlf_slot_next:
+    inc dlf_slot
+    jmp dlf_slot_loop
 dlf_done:
     rts
 
-; draw_one_flag: A = starting column of a 2-cell-wide "x1" flag at the
-; fixed rows 23-24 (col*8 done as a single byte add - safe since callers
-; only ever pass small columns, well under 32).
+; draw_one_flag/draw_one_flag5/draw_one_flag10: A = starting column of
+; a 2-cell-wide flag icon at the fixed rows 23-24. Each icon type's 4
+; 8-byte quadrants (top_left/top_right/bottom_left/bottom_right) are
+; declared back to back, so a single base pointer + y offsets 0-31
+; covers all 4. dof_colorram is the same (6, blue) for all three real
+; icons - only ever used by the tl/bl cells - but the matrix bytes
+; differ in the br cell (x1's is magenta-only, $04; x10/x5 genuinely
+; need both blue and magenta there, $64), so each routine copies its
+; own real per-type matrix into the shared dof_matrix scratch before
+; falling into draw_flag_generic, rather than one fixed array.
+dof_matrix:
+ .res 4
+dof_colorram:
+ .byte 6
+
+flag10_matrix:
+ .byte $42, $64, $42, $64
+flag5_matrix:
+ .byte $42, $64, $42, $64
+flag1_matrix:
+ .byte $42, $64, $42, $04
+
+draw_one_flag10:
+    sta temp1
+    ldy #3
+dof10_copy_matrix:
+    lda flag10_matrix,y
+    sta dof_matrix,y
+    dey
+    bpl dof10_copy_matrix
+    lda #<flag10_top_left
+    sta dof_ptr
+    lda #>flag10_top_left
+    sta dof_ptr+1
+    jmp draw_flag_generic
+
+draw_one_flag5:
+    sta temp1
+    ldy #3
+dof5_copy_matrix:
+    lda flag5_matrix,y
+    sta dof_matrix,y
+    dey
+    bpl dof5_copy_matrix
+    lda #<flag5_top_left
+    sta dof_ptr
+    lda #>flag5_top_left
+    sta dof_ptr+1
+    jmp draw_flag_generic
+
 draw_one_flag:
     sta temp1
+    ldy #3
+dof1_copy_matrix:
+    lda flag1_matrix,y
+    sta dof_matrix,y
+    dey
+    bpl dof1_copy_matrix
+    lda #<flag_top_left
+    sta dof_ptr
+    lda #>flag_top_left
+    sta dof_ptr+1
+    ; fall through
 
+draw_flag_generic:
     ; bitmap: compute the top-left cell's address once; the other 3
     ; cells are fixed byte offsets from it (+8 = one cell right, +320 =
     ; one row down), not each independently recomputed from col*8.
@@ -3968,12 +4593,24 @@ draw_one_flag:
     sta temp3+1
     ldy #0
 dof_tl:
-    lda flag_top_left,y
+    lda (dof_ptr),y
     sta (temp3),y
     iny
     cpy #8
     bne dof_tl
 
+    ; dof_ptr (the SOURCE) advances by 8 to the next quadrant, and Y
+    ; resets to 0 so the DESTINATION write is relative to the newly-
+    ; advanced temp3 - using one continuously-incrementing Y for both
+    ; (as this used to) writes quadrants tr/bl/br 8/16/24 bytes past
+    ; their real cells instead of into them ("truncated flags").
+    lda dof_ptr
+    clc
+    adc #8
+    sta dof_ptr
+    bcc dof_ptr_ok1
+    inc dof_ptr+1
+dof_ptr_ok1:
     lda temp3
     clc
     adc #8
@@ -3983,12 +4620,19 @@ dof_tl:
     sta temp3+1
     ldy #0
 dof_tr:
-    lda flag_top_right,y
+    lda (dof_ptr),y
     sta (temp3),y
     iny
     cpy #8
     bne dof_tr
 
+    lda dof_ptr
+    clc
+    adc #8
+    sta dof_ptr
+    bcc dof_ptr_ok2
+    inc dof_ptr+1
+dof_ptr_ok2:
     lda temp3
     clc
     adc #<(320-8)
@@ -3998,12 +4642,19 @@ dof_tr:
     sta temp3+1
     ldy #0
 dof_bl:
-    lda flag_bottom_left,y
+    lda (dof_ptr),y
     sta (temp3),y
     iny
     cpy #8
     bne dof_bl
 
+    lda dof_ptr
+    clc
+    adc #8
+    sta dof_ptr
+    bcc dof_ptr_ok3
+    inc dof_ptr+1
+dof_ptr_ok3:
     lda temp3
     clc
     adc #8
@@ -4013,7 +4664,7 @@ dof_bl:
     sta temp3+1
     ldy #0
 dof_br:
-    lda flag_bottom_right,y
+    lda (dof_ptr),y
     sta (temp3),y
     iny
     cpy #8
@@ -4029,16 +4680,16 @@ dof_br:
     adc #>($4000+23*40)
     sta temp4+1
 
-    lda #$42
+    lda dof_matrix
     ldy #0
     sta (temp4),y
-    lda #$64
+    lda dof_matrix+1
     ldy #1
     sta (temp4),y
-    lda #$42
+    lda dof_matrix+2
     ldy #40
     sta (temp4),y
-    lda #$04
+    lda dof_matrix+3
     ldy #41
     sta (temp4),y
 
@@ -4051,9 +4702,49 @@ dof_br:
     lda #0
     adc #>($D800+23*40)
     sta temp2+1
-    lda #6
+    lda dof_colorram
     ldy #0
     sta (temp2),y
+    rts
+
+; erase_flag_cell: A = starting column of a 2-cell-wide flag slot to
+; blank. VIC-II multicolor bit-pairs of 00 always show the GLOBAL
+; background color ($D021) regardless of screen-matrix/color-RAM
+; content, so zeroing just the bitmap bytes is a complete erase - no
+; need to also touch matrix/color-RAM (unlike draw_flag_generic).
+erase_flag_cell:
+    sta temp1
+    asl a
+    asl a
+    asl a
+    clc
+    adc #<($6000+23*40*8)
+    sta temp3
+    lda #0
+    adc #>($6000+23*40*8)
+    sta temp3+1
+    lda #0
+    ldy #0
+efc_top:
+    sta (temp3),y
+    iny
+    cpy #16
+    bne efc_top
+
+    lda temp3
+    clc
+    adc #<320
+    sta temp3
+    lda temp3+1
+    adc #>320
+    sta temp3+1
+    lda #0
+    ldy #0
+efc_bottom:
+    sta (temp3),y
+    iny
+    cpy #16
+    bne efc_bottom
     rts
 
 ; --- Lives icon, bottom-right corner - decoded from FLAGS.asm's
@@ -4640,6 +5331,31 @@ flag_bottom_left:
     .byte $27,$27,$25,$24,$20,$20,$20,$20
 flag_bottom_right:
     .byte $A0,$80,$00,$00,$00,$00,$00,$00
+
+; flag10_*/flag5_*: real data, decoded from FLAGS.asm's own flaggra
+; blocks 0/1 (x10/x5) via an exact instruction-by-instruction trace of
+; flagson's byte-to-scanline-to-buffer mapping (which mixes flaggra-
+; sourced bytes with literal constants - not the same simple layout as
+; the alien/ship dual-buffer sprites) - verified by re-deriving the x1
+; block (below) the same way and confirming it reproduces the real,
+; already-shipped flag_top_left/etc bytes exactly, byte for byte.
+flag10_top_left:
+    .byte $00,$00,$20,$25,$25,$2D,$2D,$2D
+flag10_top_right:
+    .byte $00,$00,$00,$80,$A8,$56,$66,$66
+flag10_bottom_left:
+    .byte $2D,$2D,$25,$25,$20,$20,$20,$20
+flag10_bottom_right:
+    .byte $66,$56,$A8,$80,$00,$00,$00,$00
+
+flag5_top_left:
+    .byte $00,$00,$20,$25,$25,$27,$27,$27
+flag5_top_right:
+    .byte $00,$00,$00,$00,$80,$60,$A8,$68
+flag5_bottom_left:
+    .byte $25,$27,$25,$25,$20,$20,$20,$20
+flag5_bottom_right:
+    .byte $68,$60,$80,$00,$00,$00,$00,$00
 
 ; print_bitmap_line: prints a $FF-terminated string of glyph codes (see
 ; the letter/digit code scheme above str_scr below) as MULTICOLOR bitmap

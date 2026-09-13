@@ -5,8 +5,7 @@
 ;;
 ;; Twitter @KevEdwardsRetro
 ;;
-
-;; Moving star field for the C64 multicolor bitmap screen (see INIT.asm's
+;; C64 port - moving star field for the C64 multicolor bitmap screen (see INIT.asm's
 ;; file header for the overall bitmap-mode architecture).
 ;;
 ;; This is NOT a line-by-line port of the BBC routine below it used to be.
@@ -548,9 +547,3 @@ srr_next:
  RTS
 srr_diff_lo:
  .byte 0
-
-
-;; ]
-;; PRINT"Stars from &";~B%;" to &";~P%-1;" (";P%-B%;")"
-;; PAGE=&5800
-;; RETURN
