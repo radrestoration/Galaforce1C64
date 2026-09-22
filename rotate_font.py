@@ -3,7 +3,9 @@
 
 def transpose_bbc_to_c64(input_path, output_path):
     source = open(input_path, "rb").read()
-    output = bytearray(8)  # Character 0 is the blank space.
+    output = bytearray()  # Glyph 0 is the real font's own digit "0" (see
+                           # src/CHARP.asm's DATA layout) - space is real
+                           # glyph 38, not a synthetic slot 0.
 
     for offset in range(0, len(source), 5):
         columns = source[offset:offset + 5]

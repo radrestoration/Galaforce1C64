@@ -128,7 +128,6 @@ title_wait_loop:
     sta score_digits+1
     sta score_digits+2
     sta score_digits+3
-    lda #1
     sta score_glyphs
     sta score_glyphs+1
     sta score_glyphs+2
@@ -218,7 +217,6 @@ game_start:
     sta score_digits+1
     sta score_digits+2
     sta score_digits+3
-    lda #1
     sta score_glyphs
     sta score_glyphs+1
     sta score_glyphs+2
@@ -772,19 +770,15 @@ mbs_loop:
     beq mbs_next
 
     ; A bullet flies from the ship all the way to row 0 on every single
-    ; shot, so unlike aliens/stars (kept off row 3/23/24 by not letting
-    ; them go there at all) a bullet genuinely has to cross row 3 (the
-    ; score bar) - it's XOR-drawn, and print_bitmap_line's text there is
-    ; ORA-only/never erased, so a bullet whose XOR toggle lands mid-
-    ; transit at the exact frame a score redraw happens can bake a wrong
-    ; bit in permanently (this was the remaining source of "still
-    ; corrupted" after the star/alien fixes - those closed the
-    ; continuous-exposure paths, not the fast one-frame flyby). Fix:
-    ; just don't XOR-draw a bullet while it's on a protected row - one
-    ; invisible frame passing through is a fair trade for never
+    ; shot, so it genuinely has to cross row 0 (the score bar) - it's
+    ; XOR-drawn, and print_bitmap_line's text there is ORA-only/never
+    ; erased, so a bullet whose XOR toggle lands mid-transit at the exact
+    ; frame a score redraw happens can bake a wrong bit in permanently.
+    ; Fix: just don't XOR-draw a bullet while it's on a protected row -
+    ; one invisible frame passing through is a fair trade for never
     ; touching that memory at all. is_row_protected is STARS.asm's same
-    ; row-3/23/24 check already used for stars - reused here rather than
-    ; duplicated.
+    ; row-0/23/24 check already used for stars (and now aliens - see
+    ; draw_alien_x/erase_alien_x) - reused here rather than duplicated.
     lda bullet_row,x
     sta temp1
     jsr is_row_protected
@@ -1192,6 +1186,18 @@ caa_row_done:
 ; tables below (temp3/temp4/temp2 already point at the right cell by
 ; compute_alien_addr, called once here, not per-type). Preserves X.
 ;
+; First checks both display rows the 2-row-tall sprite would occupy
+; (alien_disp_row,X and +1) against is_row_protected (STARS.asm's same
+; row-0/23/24 HUD check already used for stars and bullets) - if either
+; is protected, the alien's position still updates normally elsewhere
+; (alien_x/alien_y, alien_disp_col/row), it just doesn't get drawn this
+; time, and alien_visible,X is cleared so erase_alien_x knows there's
+; nothing here to undo later. This is the same "logically there, not
+; rendered" treatment move_bullets/move_alien_bullets already use for
+; bullets crossing these rows - own-palette overwrite drawing (unlike
+; XOR) has no self-cancelling way to pass through HUD text/flags without
+; damaging them, so skipping the write entirely is the fix, not XOR.
+;
 ; Two overlapping own-palette objects still color-clash where they share
 ; a cell (whichever draws most recently wins that cell's bitmap AND
 ; colors outright, erase_alien_x/erase_ship just guard against either of
@@ -1246,6 +1252,21 @@ dab_type:
  .byte 0
 
 draw_alien_x:
+    lda alien_disp_row,x
+    sta temp1
+    jsr is_row_protected
+    lda star_row_protected
+    bne dax_hidden
+    lda alien_disp_row,x
+    clc
+    adc #1
+    sta temp1
+    jsr is_row_protected
+    lda star_row_protected
+    bne dax_hidden
+
+    lda #1
+    sta alien_visible,x
     jsr compute_alien_addr
     lda alien_type,x
     sta dab_type
@@ -1255,6 +1276,10 @@ draw_alien_x:
     lda alien_bitmap_hi,y
     sta dab_ptr+1
     jmp draw_alien_bitmap_generic
+dax_hidden:
+    lda #0
+    sta alien_visible,x
+    rts
 
 ; draw_alien_bitmap_generic: temp2/temp3/temp4 already point at this
 ; alien's color-RAM/bitmap/screen-matrix cells (compute_alien_addr);
@@ -1532,7 +1557,14 @@ deh_bottom:
 ; erase_ship call this X-slot-indexed, and returning through a register
 ; would race against the X/Y restore below on the way out. An exploding
 ; alien still counts as covering its cells (it's still visually there
-; mid-burst, occupying the same footprint it always did).
+; mid-burst, occupying the same footprint it always did) - but only if
+; it's actually drawn: alien_visible,X is also checked below, so an
+; active alien currently hidden in a protected HUD row (see draw_alien_x/
+; alien_explode_tick) does NOT count as covering anything, since nothing
+; of it is on screen. Without that check, a hidden alien's footprint
+; would make erase_alien_x skip erasing a DIFFERENT, actually-visible
+; alien's old cell when it moved on - the real cause of "leftover alien
+; bits" turning up around the flags, where hidden aliens cluster.
 cell_check_col:
  .byte 0
 cell_check_row:
@@ -1584,6 +1616,9 @@ icc_alien_loop:
 icc_check_alien:
     lda alien_active,x
     beq icc_next_alien
+    lda alien_visible,x        ; active but hidden (in a protected HUD
+    beq icc_next_alien          ; row - see draw_alien_x) draws nothing,
+                                  ; so it can't be covering this cell either
     lda cell_check_col
     cmp alien_disp_col,x
     bcc icc_next_alien
@@ -1632,7 +1667,16 @@ icc_done:
 ; (whichever draws most recently wins that cell's colors AND bitmap
 ; outright) - see draw_alien_x's header on why blending was tried and
 ; reverted.
+;
+; First checks alien_visible,X: if draw_alien_x last skipped drawing
+; this alien (a protected HUD row - see its own header), there is
+; nothing on screen to erase, and erasing anyway would blank whatever
+; real content (score bar/flags) is actually sitting in those cells.
 erase_alien_x:
+    lda alien_visible,x
+    bne eax_do_erase
+    rts
+eax_do_erase:
     jsr compute_alien_addr
 
     ; cell 0: top-left (disp_col+0, disp_row+0), temp3+0, matrix/color y=0
@@ -1881,6 +1925,8 @@ eax_c5_erase:
     sta sce_range_len
     jsr star_restore_range
 eax_c5_skip:
+    lda #0
+    sta alien_visible,x
     rts
 
 ALIEN_COUNT = 8
@@ -1902,6 +1948,18 @@ alien_type:
 alien_disp_col:
  .res ALIEN_COUNT
 alien_disp_row:
+ .res ALIEN_COUNT
+; alien_visible: 1 if this alien's cells currently hold its own drawn
+; pixels, 0 if draw_alien_x last skipped drawing it (its footprint
+; overlapped a protected HUD row - see draw_alien_x/erase_alien_x). Lets
+; erase_alien_x tell a genuine "nothing to erase" apart from "erase like
+; normal" without re-deriving it from disp_row (which by erase time may
+; already reflect a still-protected position that was never drawn to
+; begin with). Not `.res`-zeroed for a reason: every spawn path
+; (pas_spawn/alien_spawn_child) calls draw_alien_x immediately after
+; activating a slot, which sets this correctly before anything could
+; read it - an alien is never erased before its first draw.
+alien_visible:
  .res ALIEN_COUNT
 alien_x:
  .res ALIEN_COUNT
@@ -1965,13 +2023,49 @@ init_alien_hp:
 ; draw_alien_x's header on why draw isn't blended), so no erase is
 ; needed between frames, only once at the very end. Deactivates the slot
 ; for real once all 6 frames have shown.
+;
+; Checks the same 2-row protection draw_alien_x does before drawing a
+; frame - draw_explosion_here used to skip that check entirely (it's a
+; separate call path from draw_alien_x, not routed through it), so an
+; alien that died while hidden in a protected row would still flash 6
+; explosion frames directly onto the score bar/flags, and since
+; alien_visible stayed 0 (last set by draw_alien_x while hidden),
+; aet_finish's erase_alien_x saw "nothing to erase" and never cleaned up
+; the last frame - the actual cause of the leftover alien debris seen in
+; the bottom-left flags area. An alien doesn't move while exploding
+; (this tick never touches alien_x/alien_y), so the protected/not
+; protected state is the same every frame - checking it each tick anyway
+; is cheap and keeps this in lockstep with alien_visible without extra
+; state.
 alien_explode_tick:
     lda alien_explode_timer,x
     cmp #EXPLOSION_FRAME_COUNT
     bcs aet_finish
+
+    lda alien_disp_row,x
+    sta temp1
+    jsr is_row_protected
+    lda star_row_protected
+    bne aet_skip_frame
+    lda alien_disp_row,x
+    clc
+    adc #1
+    sta temp1
+    jsr is_row_protected
+    lda star_row_protected
+    bne aet_skip_frame
+
+    lda #1
+    sta alien_visible,x
+    lda alien_explode_timer,x
     sta explosion_frame_num
     jsr compute_alien_addr
     jsr draw_explosion_here
+    jmp aet_advance
+aet_skip_frame:
+    lda #0
+    sta alien_visible,x
+aet_advance:
     inc alien_explode_timer,x
     rts
 aet_finish:
@@ -2885,16 +2979,19 @@ ard_new_row:
 ; kill instead of just scaling the position was inventing behavior, not
 ; porting it. This scales instead, but the boundary needs care: real
 ; xycalc's "CPY#23" guard only protects scanlines 0-22 (partway through
-; real row 2), so real row 3 is fully valid on the BBC - but is_row_
-; protected reserves ALL of OUR row 3 for the score bar, a whole row
-; more than the real guard does. An earlier version of this table
-; mapped real row 3 straight to our row 3, which let aliens legitimately
-; occupying a valid real position draw straight into the score bar -
-; the actual cause of score corruption appearing right at wave start
-; (patt2/patt3 both spawn at real row 3). Fixed: real rows 3-29 (27
-; rows, the real usable band) now scale onto our rows 4-22 (19 rows,
-; our actual safe band, matching the row-4 floor already established
-; elsewhere) - not 3-22. Rows 30-31 (both screens' bottom HUD, verified
+; real row 2), so real row 3 is fully valid on the BBC. This table was
+; originally built to also avoid OUR row 3 as a display target, on the
+; belief that is_row_protected reserved it for the score bar - that
+; belief turned out to be wrong (is_row_protected's row check was itself
+; a bug: the score bar is drawn at row 0, not row 3 - see its own header
+; in STARS.asm) but leaving real rows 3-29 (27 rows) scaled onto our
+; rows 4-22 (19 rows) instead of 3-22 is harmless either way, just one
+; row of unused display precision, so the mapping numbers below are left
+; as-is rather than re-tuned. The real HUD-overlap problem this was
+; trying to solve is now handled directly at draw time instead (see
+; draw_alien_x/erase_alien_x's own is_row_protected checks), which works
+; regardless of how this table happens to map real rows to display rows.
+; Rows 30-31 (both screens' bottom HUD, verified
 ; via flagson's addres/addres1 matching line_start[30]/[31] exactly)
 ; still map 1:1 to our 23-24. Real rows 0-2 never occur in any actual
 ; spawn/movement data (verified - nothing in alien_spawn_table goes
@@ -3557,7 +3654,7 @@ sc_clear_bullets:
     lda bullet_active,x
     beq sc_cb_next
     ; Same protected-row guard move_bullets uses: draw_bullet_x XOR-
-    ; erases, but a bullet caught mid-transit through row 3/23/24 was
+    ; erases, but a bullet caught mid-transit through row 0/23/24 was
     ; never actually drawn there (move_bullets already skips it) - erase
     ; it unconditionally here and the XOR toggle bakes a bullet-shaped
     ; hole into the score bar/flags instead of removing it. This was
@@ -4693,14 +4790,31 @@ dof_br:
     ldy #41
     sta (temp4),y
 
-    ; color-RAM: only the top-left cell ever draws a "11" pixel pattern,
-    ; so it's the only one that needs its color-RAM byte set.
+    ; color-RAM: top-left AND bottom-left both draw "11"-coded pixels in
+    ; all 3 real icons (x1/x10/x5, verified by checking every byte, not
+    ; assumed) - top-right/bottom-right never do. The previous "only
+    ; top-left needs it" comment was true only by accident for x1's own
+    ; shape and left bottom-left's color-RAM byte unset/stale, which is
+    ; what caused x10/x5's "B" (blue) rows to render as plain magenta
+    ; partway down - the flag body's real blue accent lives in exactly
+    ; the rows that need this second write.
     lda temp1
     clc
     adc #<($D800+23*40)
     sta temp2
     lda #0
     adc #>($D800+23*40)
+    sta temp2+1
+    lda dof_colorram
+    ldy #0
+    sta (temp2),y
+
+    lda temp2
+    clc
+    adc #40
+    sta temp2
+    lda temp2+1
+    adc #0
     sta temp2+1
     lda dof_colorram
     ldy #0
@@ -5072,9 +5186,10 @@ dtt_saved_x:
 score_digits:
  .byte 0,0,0,0
 score_glyphs:
- .byte 1,1,1,1,1,$FF       ; "00000" initially - kept in sync with
+ .byte 0,0,0,0,0,$FF       ; "00000" initially - kept in sync with
                              ; score_digits by add_score, not .res'd zero
-                             ; (glyph code 0 is blank, not the digit "0")
+                             ; (glyph code = digit value directly; blank/
+                             ; space is a separate code, 38, unused here)
 
 SCORE_VALUE_COL = 8
 HI_COL          = 17
@@ -5116,24 +5231,36 @@ as_store0:
     sta score_digits
 as_rebuild:
     lda score_digits+3
-    clc
-    adc #1
     sta score_glyphs
     lda score_digits+2
-    clc
-    adc #1
     sta score_glyphs+1
     lda score_digits+1
-    clc
-    adc #1
     sta score_glyphs+2
     lda score_digits
-    clc
-    adc #1
     sta score_glyphs+3
     jmp redraw_score
 
+; redraw_score: called by add_score every time the score changes, at the
+; same fixed cells every time. print_bitmap_line only ever ORAs new
+; glyph bits into the bitmap - correct for text drawn once, but wrong
+; here: without clearing first, an old digit's bits stay set underneath
+; whatever new digit gets drawn over it, forever - this is the actual
+; cause of the score corruption seen during play (worst on the
+; tens/hundreds digits since those change the most often, which matches
+; what was reported). Clears all 8 cells (64 bitmap bytes) the 5-glyph
+; field can ever occupy - SCORE_VALUE_COL and 7 more cells past it,
+; matching print_bitmap_line's own 1.5-cells-per-glyph pitch for a
+; 5-glyph string (see its header) - before every redraw, not just the
+; first.
 redraw_score:
+    ldy #0
+rs_clear:
+    lda #0
+    sta $6000+SCORE_VALUE_COL*8,y
+    iny
+    cpy #64
+    bne rs_clear
+
     lda #<score_glyphs
     sta temp2
     lda #>score_glyphs
@@ -5705,26 +5832,30 @@ btc_bottom:
     bne btc_bottom
     rts
 
-; Glyph codes: letter = 10 + alphabet position (A=11..Z=36), digit = 1 +
-; digit value (0=1..9=10), 0 = blank/space. Each string ends with $FF.
+; Glyph codes: the real BBC scheme (src/CHARP.asm's own DATA layout) -
+; digit = digit value (0=0..9=9), letter = 10 + 0-indexed alphabet
+; position (A=10..Z=35), . = 36, - = 37, space = 38, ( = 39, ) = 40.
+; Each string ends with $FF. Where a real CHARP.asm string exists for
+; the same text, its EQUB sequence is copied directly rather than
+; recomputed.
 str_scr:
-    .byte 29,13,28,$FF                              ; SCR
+    .byte 28,12,27,$FF                              ; SCR (CHARP.asm SCRtext)
 str_hi:
-    .byte 18,19,$FF                                 ; HI
+    .byte 17,18,$FF                                 ; HI (CHARP.asm HItext)
 str_hiscore:
-    .byte 4,1,1,1,1,$FF                             ; "30000" (placeholder)
+    .byte 3,0,0,0,0,$FF                             ; "30000" (placeholder)
 str_bykevin:
-    .byte 12,35,0,21,15,32,19,24,0,15,14,33,11,28,14,29,$FF   ; BY KEVIN EDWARDS
+    .byte 11,34,38,20,14,31,18,23,38,14,13,32,10,27,13,28,$FF   ; BY KEVIN EDWARDS (CHARP.asm myname)
 str_press:
-    .byte 26,28,15,29,29,0,29,26,11,13,15,0,25,28,0,16,19,28,15,$FF ; PRESS SPACE OR FIRE
+    .byte 25,27,14,28,28,38,28,25,10,12,14,38,24,27,38,15,18,27,14,$FF ; PRESS SPACE OR FIRE (CHARP.asm pressspace)
 str_toplay:
-    .byte 30,25,0,26,22,11,35,$FF                   ; TO PLAY
+    .byte 29,24,38,25,21,10,34,$FF                  ; TO PLAY (CHARP.asm pressspace2)
 str_superior:
-    .byte 29,31,26,15,28,19,25,28,0,29,25,16,30,33,11,28,15,$FF ; SUPERIOR SOFTWARE
+    .byte 28,30,25,14,27,18,24,27,38,28,24,15,29,32,10,27,14,$FF ; SUPERIOR SOFTWARE (CHARP.asm copyr)
 str_k:
-    .byte 21,$FF                                    ; K
+    .byte 20,$FF                                    ; K (CHARP.asm key_joy_letter)
 str_s:
-    .byte 29,$FF                                    ; S
+    .byte 28,$FF                                    ; S (CHARP.asm sound_letter)
 
 ; Placeholder high-score table text - HIGH.asm's real one (hsnum/hstxt,
 ; up to 10-char names + 7-digit scores, ahigh/pht) reads and writes
@@ -5732,17 +5863,17 @@ str_s:
 ; separate concern" per the demo-mode plan). These are fixed strings
 ; standing in for that until scoring itself exists.
 str_hs_title:
-    .byte 18,19,17,18,0,29,13,25,28,15,29,$FF        ; HIGH SCORES
+    .byte 17,18,16,17,38,28,12,24,27,14,28,$FF        ; HIGH SCORES
 str_hs1:
-    .byte 2,0,21,15,32,0,2,1,1,1,1,1,$FF              ; 1 KEV 100000
+    .byte 1,38,20,14,31,38,1,0,0,0,0,0,$FF            ; 1 KEV 100000
 str_hs2:
-    .byte 3,0,29,31,26,0,1,9,1,1,1,1,$FF              ; 2 SUP 080000
+    .byte 2,38,28,30,25,38,0,8,0,0,0,0,$FF            ; 2 SUP 080000
 str_hs3:
-    .byte 4,0,13,7,5,0,1,7,1,1,1,1,$FF                ; 3 C64 060000
+    .byte 3,38,12,6,4,38,0,6,0,0,0,0,$FF              ; 3 C64 060000
 str_hs4:
-    .byte 5,0,11,11,11,0,1,5,1,1,1,1,$FF              ; 4 AAA 040000
+    .byte 4,38,10,10,10,38,0,4,0,0,0,0,$FF            ; 4 AAA 040000
 str_hs5:
-    .byte 6,0,12,12,12,0,1,3,1,1,1,1,$FF              ; 5 BBB 020000
+    .byte 5,38,11,11,11,38,0,2,0,0,0,0,$FF            ; 5 BBB 020000
 
 ; LEFT_TABLE/RIGHT_TABLE: indexed by a source glyph row's top 5 bits (its
 ; 5 real pixel columns, srcbyte>>3, giving an index 0-31), giving the
@@ -5807,8 +5938,9 @@ TITLE_B2:
     .byte $00,$A0,$00,$A0,$00,$A0,$00,$A0
 
 ; Real spfont glyph codes for GALAFORCE's 9 letters in order (letter code
-; = 10 + alphabet position; A repeats, drawn from the same code twice).
+; = 10 + 0-indexed alphabet position, A=10..Z=35; A repeats, drawn from
+; the same code twice) - copied directly from CHARP.asm's galaforce EQUBs.
 title_letter_codes:
-    .byte 17,11,22,11,16,25,28,13,15 ; G A L A F O R C E
+    .byte 16,10,21,10,15,24,27,12,14 ; G A L A F O R C E
 colour_title:
     .byte 2                          ; red

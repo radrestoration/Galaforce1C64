@@ -126,12 +126,20 @@ scp_done:
  STA  stardat+2,x
  RTS
 
-; star_respawn_top: (re)spawns star X at the top of the band (row
-; BAND_MIN_ROW, scanline 0) with a random column and a fresh slot+color
-; (a brand new star gets its full look immediately, independent of the
-; color-slowdown timing in movestars). Preserves X.
+; star_respawn_top: (re)spawns star X at the top of the band with a
+; random column and a fresh slot+color (a brand new star gets its full
+; look immediately, independent of the color-slowdown timing in
+; movestars). Actually spawns at BAND_MIN_ROW+1, not BAND_MIN_ROW itself
+; - BAND_MIN_ROW (row 0) is the score bar, always protected (see
+; is_row_protected), and unlike si_row/ms_wrap_row this entry point used
+; to place a star there completely unconditionally, no check at all
+; (this was a real, live contributor to the score bar corruption seen
+; earlier - the one respawn path that never went through
+; is_row_protected). Row BAND_MIN_ROW+1 is never protected under the
+; current row-0/23/24 rule, so a fixed skip-one-row is enough here
+; rather than a general re-roll loop. Preserves X.
 star_respawn_top:
- LDA  #0
+ LDA  #1
  STA  star_rowcnt,x
 srt_col:
  JSR  star_rand_mask
@@ -147,11 +155,11 @@ srt_col:
  ROL  temp4+1
  ASL  temp4
  ROL  temp4+1            ; temp4 (word) = col * 8
- LDA  #<($6000+BAND_MIN_ROW*320)
+ LDA  #<($6000+(BAND_MIN_ROW+1)*320)
  CLC
  ADC  temp4
  STA  stardat,x
- LDA  #>($6000+BAND_MIN_ROW*320)
+ LDA  #>($6000+(BAND_MIN_ROW+1)*320)
  ADC  temp4+1
  STA  stardat+1,x
  JSR  star_pick_slot
@@ -160,7 +168,7 @@ srt_col:
 
 ; is_row_protected: temp1 = row to check. Sets star_row_protected = 1 if
 ; the row is one of the 3 permanently HUD-reserved rows a star must never
-; occupy - row 3 (the score bar, "SCR .... HI ......") or rows 23/24 (the
+; occupy - row 0 (the score bar, "SCR .... HI ......") or rows 23/24 (the
 ; level flags and lives icons) - else 0. That text is drawn with ORA and
 ; never redrawn/erased once placed (unlike a moving ship/alien), so an
 ; errant star bit landing there would never get cleaned up - the actual
@@ -179,7 +187,7 @@ star_row_protected:
 
 is_row_protected:
  LDA  temp1
- CMP  #3
+ CMP  #0
  BEQ  irp_yes
  CMP  #23
  BEQ  irp_yes
@@ -215,7 +223,7 @@ si_row:
                           ; value is still needed below
  JSR  is_row_protected
  LDA  star_row_protected
- BNE  si_row              ; row 3/23/24 - reject and re-roll
+ BNE  si_row              ; row 0/23/24 - reject and re-roll
  LDA  temp1
  STA  star_rowcnt,x
  STA  temp1              ; temp1 = row offset within the band (reused
@@ -362,7 +370,7 @@ ms_wrap_row:
  STA  temp1
  JSR  is_row_protected
  LDA  star_row_protected
- BNE  ms_wrap_row         ; row 3/23/24 - advance past it too; re-checks
+ BNE  ms_wrap_row         ; row 0/23/24 - advance past it too; re-checks
                            ; the BAND_ROWS-1 bound each time round, so a
                            ; star that would land on 23 then 24 (adjacent
                            ; protected rows) correctly respawns instead
