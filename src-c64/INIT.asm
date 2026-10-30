@@ -340,7 +340,29 @@ gl_exploding:
     cmp #GS_GAME_OVER
     beq game_loop_escape
     jmp game_loop
+; game_loop_escape: reached either via a real game over (ship out of
+; lives, game_state already GS_GAME_OVER) or the RUN/STOP debug escape
+; (game_state still GS_PLAYING, mid-game - see check_escape_key's own
+; comment, a testing shortcut with no real equivalent). Only run the
+; real high-score check (hs_try_insert) on an actual game over - real
+; HIGH.asm's ahigh has no "quit early" concept to match against, and it
+; would be misleading to score-check an arbitrary mid-game escape.
 game_loop_escape:
+    lda game_state
+    cmp #GS_GAME_OVER
+    bne gle_to_title
+    ; Clear and draw the table BEFORE hs_try_insert, not after - if it
+    ; decides to insert, hs_enter_name's live per-keystroke redraws
+    ; (hs_draw_row) need the existing rows already on screen to look
+    ; right while typing, matching real HIGH.asm's own ah9 ordering
+    ; (JSRpht, THEN JSRgnam, THEN JMPpht again once done - our second
+    ; "pht" is show_high_scores' own fuller redraw below, which also
+    ; restores the score bar/flags/lives/stars clear_screen just wiped).
+    jsr clear_screen
+    jsr draw_high_score_table
+    jsr hs_try_insert
+    jsr show_high_scores
+gle_to_title:
     jmp title_wait_loop
 
 ; title_frame_count was previously declared inline between game_start's
@@ -1199,9 +1221,12 @@ caa_row_done:
 ; damaging them, so skipping the write entirely is the fix, not XOR.
 ;
 ; Two overlapping own-palette objects still color-clash where they share
-; a cell (whichever draws most recently wins that cell's bitmap AND
-; colors outright, erase_alien_x/erase_ship just guard against either of
-; them wiping the other's cells on the way OUT - see erase_alien_x).
+; a cell (draw_alien_bitmap_generic now gives the lower alien slot a
+; fixed, consistent win there rather than whoever drew most recently -
+; see its own header and is_cell_blocked_by_higher_priority - so the
+; overlap still has a hard edge, but it no longer flickers between the
+; two colors; erase_alien_x/erase_ship separately guard against either
+; of them wiping the other's cells on the way OUT - see erase_alien_x).
 ; Tried blending the bitmap via ORA instead, so a background gap in one
 ; alien's shape would let the other show through - reverted: the erase-
 ; side bookkeeping it required (redraw the surviving object from scratch
@@ -1281,89 +1306,26 @@ dax_hidden:
     sta alien_visible,x
     rts
 
-; draw_alien_bitmap_generic: temp2/temp3/temp4 already point at this
-; alien's color-RAM/bitmap/screen-matrix cells (compute_alien_addr);
-; dab_ptr/dab_type say which of the 12 real alien graphics to draw.
-; Replaces the old draw_alien_bitmap_0/1/2 (one near-identical routine
-; per type, unworkable at 12 types) with a single table-driven routine -
-; same "2 linear 24-byte rows, +320 between them" shortcut draw_ship
-; uses (adjacent cells in a row sit back to back in memory), just
-; reading through a runtime pointer instead of a compile-time label.
+; draw_alien_bitmap_generic: X = alien slot (still the one draw_alien_x
+; was called with - nothing between there and here touches it). Sets
+; dab_type once (draw_alien_cell needs it for both the bitmap-source and
+; matrix/colorram-table lookups, and it doesn't change across the 6
+; cells of one alien), then draws all 6 of this alien's cells - see
+; draw_alien_cell's own header for the per-cell contested-vs-uncontested
+; logic (overwrite with this alien's own color normally, OR-blend with a
+; fixed overlap color when another higher-priority alien already owns a
+; cell).
 draw_alien_bitmap_generic:
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #24
-    sta sce_range_len
-    jsr star_evict_range      ; evict any star this cell-band is about to
-                               ; overwrite - see STARS.asm's file header
-                               ; note by star_evict_range
-    ldy #0
-dabg_top:
-    lda (dab_ptr),y
-    sta (temp3),y
-    iny
-    cpy #24
-    bne dabg_top
-
-    lda dab_ptr                ; dab_ptr += 24, for the bottom half
+    lda alien_type,x
+    sta dab_type
+    lda #0
+dabg_loop:
+    jsr draw_alien_cell
+    lda dac_cell_idx
     clc
-    adc #24
-    sta dab_ptr
-    bcc dabg_ptr_ok
-    inc dab_ptr+1
-dabg_ptr_ok:
-    lda temp3
-    clc
-    adc #<320
-    sta temp3
-    lda temp3+1
-    adc #>320
-    sta temp3+1
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #24
-    sta sce_range_len
-    jsr star_evict_range
-    ldy #0
-dabg_bottom:
-    lda (dab_ptr),y
-    sta (temp3),y
-    iny
-    cpy #24
-    bne dabg_bottom
-
-    ldy dab_type
-    lda alien_matrix_table,y
-    ldy #0
-    sta (temp4),y
-    ldy #1
-    sta (temp4),y
-    ldy #2
-    sta (temp4),y
-    ldy #40
-    sta (temp4),y
-    ldy #41
-    sta (temp4),y
-    ldy #42
-    sta (temp4),y
-    ldy dab_type
-    lda alien_colorram_table,y
-    ldy #0
-    sta (temp2),y
-    ldy #1
-    sta (temp2),y
-    ldy #2
-    sta (temp2),y
-    ldy #40
-    sta (temp2),y
-    ldy #41
-    sta (temp2),y
-    ldy #42
-    sta (temp2),y
+    adc #1
+    cmp #6
+    bne dabg_loop
     rts
 
 ; --- Alien/ship "burst" explosion - the REAL BBC explosion sequence
@@ -1575,6 +1537,13 @@ cell_check_exclude_idx:
  .byte 0
 cell_check_result:
  .byte 0
+; cell_check_covering_slot: which alien slot (0-32) was found covering
+; the cell, when cell_check_result=1 - $FF if it was the ship instead
+; (or nothing, when result=0). Lets erase_alien_x's reconstruction path
+; (see its own header) find the specific alien to redraw that cell for,
+; rather than just knowing "something is still there".
+cell_check_covering_slot:
+ .byte 0
 
 is_cell_covered:
     txa
@@ -1584,6 +1553,8 @@ is_cell_covered:
 
     lda #0
     sta cell_check_result
+    lda #$FF
+    sta cell_check_covering_slot
 
     lda cell_check_exclude_kind
     beq icc_skip_ship          ; kind 0 - the ship is asking, don't check
@@ -1604,7 +1575,8 @@ is_cell_covered:
     bcs icc_skip_ship
     lda #1
     sta cell_check_result
-    jmp icc_done
+    jmp icc_done               ; covering_slot stays $FF - covered by
+                                 ; the ship, not an alien
 icc_skip_ship:
     ldx #0
 icc_alien_loop:
@@ -1635,11 +1607,14 @@ icc_check_alien:
     bcs icc_next_alien
     lda #1
     sta cell_check_result
+    stx cell_check_covering_slot
     jmp icc_done
 icc_next_alien:
     inx
-    cpx #ALIEN_COUNT
-    bne icc_alien_loop
+    cpx alien_pool_max         ; not real BBC behavior (this whole
+    bne icc_alien_loop           ; routine is our own invention) - just
+                                   ; no point scanning slots this wave's
+                                   ; pool can never use
 icc_done:
     pla
     tay
@@ -1647,26 +1622,284 @@ icc_done:
     tax
     rts
 
-; erase_alien_x: X = alien slot index. Per-cell guarded erase, not a
-; blanket 2x24-byte reset - for each of the 6 cells this alien occupies,
-; only resets it to background if no OTHER active hard object (ship or
-; another alien) still covers that exact cell (is_cell_covered); a
-; covered cell is left completely untouched, since the other object still
-; needs it - this is the fix for the alien-overlap flicker/black-
-; rectangle bug (the old blanket erase would blindly wipe out whatever
-; the other object had drawn there). A cell that genuinely IS erased also
-; gets star_restore_range'd for its own 8-byte range, redrawing any star
-; that had been evicted from it (see star_evict_range in STARS.asm) - the
-; fix for stuck stars. X survives every jsr below untouched: both
-; is_cell_covered and star_restore_range fully preserve X/Y internally
-; (see their own headers), so alien_disp_col,x/alien_disp_row,x stay
-; correctly indexed by the ORIGINAL alien slot through all 6 cells with
-; no extra save/restore needed here.
+; cbp_asking_slot/cbp_result: scratch for is_cell_blocked_by_higher_
+; priority below.
+cbp_asking_slot:
+ .byte 0
+cbp_result:
+ .byte 0
+
+; is_cell_blocked_by_higher_priority: cell_check_col/row are inputs
+; (same meaning as is_cell_covered's), cbp_asking_slot = the alien slot
+; about to draw this cell. Sets cbp_result = 1 if some OTHER active,
+; VISIBLE alien with a LOWER slot index already occupies this cell -
+; lower-slot-wins is an arbitrary but FIXED precedence rule, picked only
+; so two overlapping aliens agree consistently on who owns a shared
+; cell, instead of "whoever's independent movement tick last happened to
+; redraw" - which flips back and forth as the two aliens' own per-move
+; magnitudes (alien_mult) drift in and out of sync, and reads as
+; flicker. Used by draw_alien_bitmap_generic - a blocked cell is left
+; completely untouched (the higher-priority alien's own bitmap/colors
+; there are undisturbed), matching how erase_alien_x already leaves a
+; covered cell untouched on the way out. Preserves X/Y.
+is_cell_blocked_by_higher_priority:
+    txa
+    pha
+    tya
+    pha
+
+    lda #0
+    sta cbp_result
+    ldx #0
+icbp_loop:
+    cpx cbp_asking_slot
+    bcs icbp_next              ; X >= asking slot - not higher priority
+    lda alien_active,x
+    beq icbp_next
+    lda alien_visible,x
+    beq icbp_next
+    lda cell_check_col
+    cmp alien_disp_col,x
+    bcc icbp_next
+    sec
+    sbc alien_disp_col,x
+    cmp #3
+    bcs icbp_next
+    lda cell_check_row
+    cmp alien_disp_row,x
+    bcc icbp_next
+    sec
+    sbc alien_disp_row,x
+    cmp #2
+    bcs icbp_next
+    lda #1
+    sta cbp_result
+    jmp icbp_done
+icbp_next:
+    inx
+    cpx alien_pool_max         ; same reasoning as is_cell_covered's own
+    bne icbp_loop                 ; bound above - not real BBC behavior,
+                                   ; just an optimization
+icbp_done:
+    pla
+    tay
+    pla
+    tax
+    rts
+
+; ALIEN_OVERLAP_MATRIX/COLORRAM: the fixed color a contested cell shows,
+; instead of whichever alien's own palette happened to still be sitting
+; there. Solid white in this port's multicolor scheme (hi/lo nibble and
+; color-RAM all pick the same code) - reads as a deliberate "these are
+; touching" indicator rather than an arbitrary mismatched color.
+ALIEN_OVERLAP_MATRIX = $11
+ALIEN_OVERLAP_COLORRAM = 1
+
+; dac_dest_lo/hi, dac_src_off, dac_y_off, dac_dx/dy: per-cell-index
+; (0=TL,1=TM,2=TR,3=BL,4=BM,5=BR - same layout the old unrolled
+; draw_alien_bitmap_generic/erase_alien_x blocks used) lookup tables for
+; draw_alien_cell below. dac_dest_*: byte offset from the alien's
+; top-left bitmap address (compute_alien_addr) to this cell's bitmap
+; address - 0/8/16 across the top row, 320/328/336 across the bottom
+; row (the same "+8,+8,+304,+8,+8" walk erase_alien_x's old unrolled
+; code used, just expressed as absolute offsets from the top-left
+; instead of a running total). dac_src_off: byte offset into the
+; alien's SOURCE bitmap data for this cell - contiguous regardless of
+; row (0,8,16,24,32,40), since the source is laid out as 2 packed rows
+; of 3 cells, unlike the 320-byte-stride destination. dac_y_off: the
+; screen-matrix/color-RAM byte offset for this cell (0,1,2,40,41,42).
+; dac_dx/dy: this cell's offset from the alien's own disp_col/disp_row,
+; needed to build cell_check_col/row for the contestation check.
+dac_dest_lo:
+ .byte <0,<8,<16,<320,<328,<336
+dac_dest_hi:
+ .byte >0,>8,>16,>320,>328,>336
+dac_src_off:
+ .byte 0,8,16,24,32,40
+dac_y_off:
+ .byte 0,1,2,40,41,42
+dac_dx:
+ .byte 0,1,2,0,1,2
+dac_dy:
+ .byte 0,0,0,1,1,1
+
+dac_cell_idx:
+ .byte 0
+dac_saved_x:
+ .byte 0
+dac_y_offset:
+ .byte 0
+
+; draw_alien_cell: X = alien slot, A = which of its 6 relative cells
+; (see the table header above). dab_type must already be set (=
+; alien_type,X - draw_alien_bitmap_generic sets it once and reuses it
+; across all 6 calls; erase_alien_x's reconstruction path sets it fresh
+; for whichever alien it's reconstructing).
 ;
-; Drawing over another alien still color-clashes where they overlap
-; (whichever draws most recently wins that cell's colors AND bitmap
-; outright) - see draw_alien_x's header on why blending was tried and
-; reverted.
+; Draws just that one cell: if is_cell_blocked_by_higher_priority says
+; no other active/visible alien with a lower slot already owns it,
+; overwrites normally with this alien's own bitmap/colors (the original
+; behavior). If it IS contested, ORs this alien's bitmap bits into
+; whatever's already there instead of overwriting (so neither shape
+; gets a rectangular bite taken out of it) and paints the cell
+; ALIEN_OVERLAP_MATRIX/COLORRAM instead of either alien's own color -
+; the color is wrong for whichever alien doesn't own the cell either
+; way, but the shape stays intact and the mismatch is a deliberate,
+; consistent color rather than "whichever alien's palette happened to
+; still be there". See draw_alien_x's header for why real per-alien
+; color correctness in a shared cell isn't achievable on this hardware
+; at all (one color set per 8x8 cell, shared by every pixel in it).
+;
+; Shared by draw_alien_bitmap_generic (calls this 6 times, once per
+; cell, for the alien that's moving) and erase_alien_x's reconstruction
+; path (calls this once, for whichever alien is found still covering a
+; cell after a DIFFERENT alien that used to share it has gone - a
+; contested cell can't just be left alone on erase the way an
+; uncontested one can, since the departing alien's ORed-in bits would
+; stay stuck there forever otherwise; erase_alien_x blanks the cell
+; first, then calls this to rebuild it from whichever alien(s) actually
+; still belong there).
+draw_alien_cell:
+    sta dac_cell_idx
+    stx dac_saved_x
+
+    jsr compute_alien_addr        ; temp2/3/4 = this alien's TOP-LEFT
+                                    ; cell addresses - doesn't touch X
+    ldx dac_saved_x
+    ldy dac_cell_idx
+
+    lda temp3
+    clc
+    adc dac_dest_lo,y
+    sta temp3
+    lda temp3+1
+    adc dac_dest_hi,y
+    sta temp3+1
+
+    lda dac_y_off,y
+    sta dac_y_offset
+
+    lda alien_disp_col,x
+    clc
+    adc dac_dx,y
+    sta cell_check_col
+    lda alien_disp_row,x
+    clc
+    adc dac_dy,y
+    sta cell_check_row
+
+    stx cbp_asking_slot
+    jsr is_cell_blocked_by_higher_priority   ; preserves X/Y
+
+    ldy dac_cell_idx
+    ldx dab_type
+    lda alien_bitmap_lo,x
+    clc
+    adc dac_src_off,y
+    sta dab_ptr
+    lda alien_bitmap_hi,x
+    adc #0
+    sta dab_ptr+1
+    ldx dac_saved_x
+
+    lda temp3
+    sta sce_range_lo
+    lda temp3+1
+    sta sce_range_hi
+    lda #8
+    sta sce_range_len
+    jsr star_evict_range          ; preserves X/Y
+
+    lda cbp_result
+    bne dac_blend
+
+    ldy #0
+dac_own_loop:
+    lda (dab_ptr),y
+    sta (temp3),y
+    iny
+    cpy #8
+    bne dac_own_loop
+
+    ldx dab_type
+    lda alien_matrix_table,x
+    ldy dac_y_offset
+    sta (temp4),y
+    ldx dab_type
+    lda alien_colorram_table,x
+    ldy dac_y_offset
+    sta (temp2),y
+    ldx dac_saved_x
+    rts
+
+dac_blend:
+    ldy #0
+dac_blend_loop:
+    lda (dab_ptr),y
+    ora (temp3),y
+    sta (temp3),y
+    iny
+    cpy #8
+    bne dac_blend_loop
+
+    ldy dac_y_offset
+    lda #ALIEN_OVERLAP_MATRIX
+    sta (temp4),y
+    ldy dac_y_offset
+    lda #ALIEN_OVERLAP_COLORRAM
+    sta (temp2),y
+    ldx dac_saved_x
+    rts
+
+; eax_recon_dx/eax_saved_x: scratch for erase_alien_x's reconstruction
+; detour below.
+eax_recon_dx:
+ .byte 0
+eax_saved_x:
+ .byte 0
+
+; eax_compute_local_cell: X must already = the covering alien's slot
+; (cell_check_covering_slot). Returns in A which of ITS 6 relative
+; cells corresponds to the current cell_check_col/row - already
+; verified by is_cell_covered to be within that alien's 3x2 footprint,
+; so dx/dy are always in range. Same 0=TL..5=BR indexing draw_alien_cell
+; uses.
+eax_compute_local_cell:
+    lda cell_check_col
+    sec
+    sbc alien_disp_col,x
+    sta eax_recon_dx
+    lda cell_check_row
+    sec
+    sbc alien_disp_row,x
+    beq eax_local_dy0
+    lda #3
+    clc
+    adc eax_recon_dx
+    rts
+eax_local_dy0:
+    lda eax_recon_dx
+    rts
+
+; erase_alien_x: X = alien slot index. Per-cell guarded erase, not a
+; blanket 2x24-byte reset - for each of the 6 cells this alien occupies:
+;   - if NOTHING else covers it (is_cell_covered), resets it to plain
+;     background, same as always.
+;   - if the SHIP covers it, leaves it completely untouched (unrelated
+;     system, own erase/draw path).
+;   - if another ALIEN still covers it, blanks the cell and calls
+;     draw_alien_cell to rebuild it fresh from that alien alone (see
+;     draw_alien_cell's own header on why a contested cell can't just be
+;     left alone the way an uncontested one can - the departing alien's
+;     ORed-in bits would otherwise stay stuck there forever).
+; A cell that's genuinely reset to background also gets
+; star_restore_range'd for its own 8-byte range, redrawing any star that
+; had been evicted from it (see star_evict_range in STARS.asm) - the fix
+; for stuck stars. X survives every jsr below untouched: is_cell_covered,
+; star_restore_range and the reconstruction detour (which explicitly
+; saves/restores it via eax_saved_x) all leave X as the ORIGINAL alien
+; slot by the time each cell block ends, so alien_disp_col,x/
+; alien_disp_row,x stay correctly indexed throughout.
 ;
 ; First checks alien_visible,X: if draw_alien_x last skipped drawing
 ; this alien (a protected HUD row - see its own header), there is
@@ -1689,7 +1922,29 @@ eax_do_erase:
     stx cell_check_exclude_idx
     jsr is_cell_covered
     lda cell_check_result
-    bne eax_c0_skip
+    beq eax_c0_normal
+    lda cell_check_covering_slot
+    cmp #$FF
+    beq eax_c0_skip
+    stx eax_saved_x
+    lda #0
+    ldy #0
+eax_c0_blank_loop:
+    sta (temp3),y
+    iny
+    cpy #8
+    bne eax_c0_blank_loop
+    ldx cell_check_covering_slot
+    jsr eax_compute_local_cell
+    pha
+    lda alien_type,x
+    sta dab_type
+    ldx cell_check_covering_slot
+    pla
+    jsr draw_alien_cell
+    ldx eax_saved_x
+    jmp eax_c0_skip
+eax_c0_normal:
     ldy #0
 eax_c0_erase:
     lda #0
@@ -1731,7 +1986,29 @@ eax_c0_skip:
     stx cell_check_exclude_idx
     jsr is_cell_covered
     lda cell_check_result
-    bne eax_c1_skip
+    beq eax_c1_normal
+    lda cell_check_covering_slot
+    cmp #$FF
+    beq eax_c1_skip
+    stx eax_saved_x
+    lda #0
+    ldy #0
+eax_c1_blank_loop:
+    sta (temp3),y
+    iny
+    cpy #8
+    bne eax_c1_blank_loop
+    ldx cell_check_covering_slot
+    jsr eax_compute_local_cell
+    pha
+    lda alien_type,x
+    sta dab_type
+    ldx cell_check_covering_slot
+    pla
+    jsr draw_alien_cell
+    ldx eax_saved_x
+    jmp eax_c1_skip
+eax_c1_normal:
     ldy #0
 eax_c1_erase:
     lda #0
@@ -1773,7 +2050,29 @@ eax_c1_skip:
     stx cell_check_exclude_idx
     jsr is_cell_covered
     lda cell_check_result
-    bne eax_c2_skip
+    beq eax_c2_normal
+    lda cell_check_covering_slot
+    cmp #$FF
+    beq eax_c2_skip
+    stx eax_saved_x
+    lda #0
+    ldy #0
+eax_c2_blank_loop:
+    sta (temp3),y
+    iny
+    cpy #8
+    bne eax_c2_blank_loop
+    ldx cell_check_covering_slot
+    jsr eax_compute_local_cell
+    pha
+    lda alien_type,x
+    sta dab_type
+    ldx cell_check_covering_slot
+    pla
+    jsr draw_alien_cell
+    ldx eax_saved_x
+    jmp eax_c2_skip
+eax_c2_normal:
     ldy #0
 eax_c2_erase:
     lda #0
@@ -1815,7 +2114,29 @@ eax_c2_skip:
     stx cell_check_exclude_idx
     jsr is_cell_covered
     lda cell_check_result
-    bne eax_c3_skip
+    beq eax_c3_normal
+    lda cell_check_covering_slot
+    cmp #$FF
+    beq eax_c3_skip
+    stx eax_saved_x
+    lda #0
+    ldy #0
+eax_c3_blank_loop:
+    sta (temp3),y
+    iny
+    cpy #8
+    bne eax_c3_blank_loop
+    ldx cell_check_covering_slot
+    jsr eax_compute_local_cell
+    pha
+    lda alien_type,x
+    sta dab_type
+    ldx cell_check_covering_slot
+    pla
+    jsr draw_alien_cell
+    ldx eax_saved_x
+    jmp eax_c3_skip
+eax_c3_normal:
     ldy #0
 eax_c3_erase:
     lda #0
@@ -1859,7 +2180,29 @@ eax_c3_skip:
     stx cell_check_exclude_idx
     jsr is_cell_covered
     lda cell_check_result
-    bne eax_c4_skip
+    beq eax_c4_normal
+    lda cell_check_covering_slot
+    cmp #$FF
+    beq eax_c4_skip
+    stx eax_saved_x
+    lda #0
+    ldy #0
+eax_c4_blank_loop:
+    sta (temp3),y
+    iny
+    cpy #8
+    bne eax_c4_blank_loop
+    ldx cell_check_covering_slot
+    jsr eax_compute_local_cell
+    pha
+    lda alien_type,x
+    sta dab_type
+    ldx cell_check_covering_slot
+    pla
+    jsr draw_alien_cell
+    ldx eax_saved_x
+    jmp eax_c4_skip
+eax_c4_normal:
     ldy #0
 eax_c4_erase:
     lda #0
@@ -1903,7 +2246,29 @@ eax_c4_skip:
     stx cell_check_exclude_idx
     jsr is_cell_covered
     lda cell_check_result
-    bne eax_c5_skip
+    beq eax_c5_normal
+    lda cell_check_covering_slot
+    cmp #$FF
+    beq eax_c5_skip
+    stx eax_saved_x
+    lda #0
+    ldy #0
+eax_c5_blank_loop:
+    sta (temp3),y
+    iny
+    cpy #8
+    bne eax_c5_blank_loop
+    ldx cell_check_covering_slot
+    jsr eax_compute_local_cell
+    pha
+    lda alien_type,x
+    sta dab_type
+    ldx cell_check_covering_slot
+    pla
+    jsr draw_alien_cell
+    ldx eax_saved_x
+    jmp eax_c5_skip
+eax_c5_normal:
     ldy #0
 eax_c5_erase:
     lda #0
@@ -1929,13 +2294,38 @@ eax_c5_skip:
     sta alien_visible,x
     rts
 
-ALIEN_COUNT = 8
+; ALIEN_COUNT=33: sized for the real game's largest per-wave pool, not a
+; typical one - see wave_pool_size/alien_pool_max below. Real waves
+; normally use 7-10 concurrent aliens; group 45 (reachable in waves
+; 3/7/11/15's real group lists) temporarily expands the pool to 33 for
+; a boss-like swarm (src/ALIENS1.asm's alien2: "CMP#45:BNEspecial:
+; LDX#33:STXaliens"). The array size has to cover the max any wave can
+; reach; alien_pool_max/alien_pool_max_m1 (set per-wave, and bumped
+; again on group 45) is what actually bounds how many of these slots a
+; given wave's spawn/move/collision loops use - see try_load_next_group
+; and init_alien_wave.
+ALIEN_COUNT = 33
 MAXPATT = 4                ; real CONST.asm value - concurrent spawn-group
                             ; slots. NOT "4 groups from different wave-list
                             ; entries at once" (see try_load_next_group's
                             ; header) - just large enough for one entry's
                             ; sub-records (patt45 needs 3, the largest).
 ALIEN_MAX_X = 149          ; safe right-edge wrap margin - see wrap_x_margin
+
+; wave_pool_size: real WAVE.asm's own per-wave first EQUB byte (pool
+; size), waves 0-15 in order - matches wave_group_list's own indexing
+; (c64_curwave AND 15). Read once per wave in init_alien_wave into
+; alien_pool_max/alien_pool_max_m1 (real aliens/aliensm1) - the dynamic
+; bound the spawn/move/collision loops below actually use, NOT
+; ALIEN_COUNT itself (which just has to be big enough for the largest
+; case - see its own comment above).
+wave_pool_size:
+ .byte 10,8,10,8,10,10,8,8,10,7,8,10,10,8,8,8
+
+alien_pool_max:
+ .byte 0
+alien_pool_max_m1:
+ .byte 0
 
 alien_active:
  .res ALIEN_COUNT
@@ -2295,6 +2685,13 @@ iaw_clear_slots:
 
     lda c64_curwave
     and #15
+    tay
+    lda wave_pool_size,y        ; real aliens/aliensm1 - see their own
+    sta alien_pool_max            ; comment above wave_pool_size (group
+    sec                           ; 45 bumps these again mid-wave, in
+    sbc #1                        ; try_load_next_group)
+    sta alien_pool_max_m1
+    tya
     asl a
     asl a
     asl a
@@ -2325,11 +2722,15 @@ try_load_next_group:
     lda init_act
     ora alien_live_count
     ora alien_bullet_live_count
-    bne tlng_done
+    beq tlng_gate_ok        ; routine's grown too big for a direct branch
+    jmp tlng_done             ; to tlng_done, so invert-and-jump instead
+tlng_gate_ok:
 
     ldx wave_off
     cpx #WAVE_GROUP_STRIDE
-    beq tlng_wave_done
+    bne tlng_wave_not_done   ; same reason - tlng_wave_done is now out
+    jmp tlng_wave_done         ; of direct-branch range
+tlng_wave_not_done:
     lda wave_base_off
     clc
     adc wave_off
@@ -2338,6 +2739,18 @@ try_load_next_group:
     cmp #WAVE_GROUP_END
     beq tlng_wave_done
     tax
+
+    ; Real ALIENS1.asm's alien2: group 45 temporarily expands the pool
+    ; to 33 for the rest of this wave (see ALIEN_COUNT's own comment) -
+    ; init_alien_wave will reset this back to the wave's own base size
+    ; on the next wave transition.
+    cpx #45
+    bne tlng_not_special
+    lda #33
+    sta alien_pool_max
+    lda #32
+    sta alien_pool_max_m1
+tlng_not_special:
     lda patt_group_row_start,x
     sta iaw_row_start
     lda patt_group_row_count,x
@@ -2451,8 +2864,8 @@ pas_find_slot:
     lda alien_active,x
     beq pas_spawn
     inx
-    cpx #ALIEN_COUNT
-    bne pas_find_slot
+    cpx alien_pool_max         ; real ALIENS2.asm proc6's "LDYaliensm1"
+    bne pas_find_slot           ; free-slot search bound
     jmp pas_next             ; pool full - drop this spawn
 pas_spawn:
     lda #1
@@ -2913,8 +3326,8 @@ asc_find_slot:
     lda alien_active,x
     beq asc_spawn
     inx
-    cpx #ALIEN_COUNT
-    bne asc_find_slot
+    cpx alien_pool_max         ; real ALIENS4.asm dat_newalien's
+    bne asc_find_slot           ; "LDYaliensm1" free-slot search bound
     ldx asc_parent
     rts                        ; pool full - drop the spawn
 asc_spawn:
@@ -3147,8 +3560,8 @@ ma_explode:
     jsr alien_explode_tick
 ma_next:
     inx
-    cpx #ALIEN_COUNT
-    bne ma_loop
+    cpx alien_pool_max         ; real ALIENS3.asm move_the_aliens's
+    bne ma_loop                  ; "CPXaliens" bound
 ma_rts:
     rts
 
@@ -3825,8 +4238,8 @@ cbac_alien_loop:
 
 cbac_next_alien:
     iny
-    cpy #ALIEN_COUNT
-    bne cbac_alien_loop
+    cpy alien_pool_max         ; real ROUT2.asm collis2's "LDXaliensm1"
+    bne cbac_alien_loop          ; bound
 cbac_next_bullet:
     inx
     cpx #BULLET_COUNT
@@ -3910,9 +4323,9 @@ cas_row_pos:
     rts
 cas_next:
     inx
-    cpx #ALIEN_COUNT
-    bne cas_loop
-    rts
+    cpx alien_pool_max         ; real ROUT2.asm collis2's "LDXaliensm1"
+    bne cas_loop                 ; bound (same collision routine as the
+    rts                          ; bullet-alien check above)
 
 ; clear_screen: blanks the bitmap and resets screen-matrix/color RAM to
 ; the star field's 3 background colors (see STARS.asm) - shared by the
@@ -5195,7 +5608,23 @@ SCORE_VALUE_COL = 8
 HI_COL          = 17
 HISCORE_COL     = 22
 
-; add_score: A = an alien_score_table value (0-9, source's own "divided
+; --- Real high-score table (src/HIGH.asm) ---
+; hs_score_digits: 8 rows x 4 bytes, same tens/hundreds/thousands/ten-
+; thousands layout as score_digits above (a row IS a snapshot of
+; score_digits at the moment it was inserted). hs_names: 8 rows x 10
+; real glyph-code bytes (digit=value, letter=10+0-indexed position,
+; space=38 - the real scheme from the font-code fix). Neither is reset
+; by game_start/title_wait_loop (unlike score_digits) - real HIGH.asm
+; never touches disk/tape, so the real table is just RAM that persists
+; across games within one power-on session, which this matches by
+; simply never clearing it after this initial load. hs_names' initial
+; fill is space (38), NOT .res's default zero - glyph code 0 is the
+; digit "0" (see score_glyphs' own comment above), so a zero-filled
+; name would show as "0000000000", not blank.
+hs_score_digits:
+ .res 8*4
+hs_names:
+ .res 8*10, 38
 ; by ten" units) to add. Ripples a carry through score_digits like a
 ; plain 4-digit decimal counter (capping rather than wrapping if it ever
 ; overflows - out of display room, not a real game-breaking case), then
@@ -5371,53 +5800,547 @@ dks_loop:
     bne dks_loop
     rts
 
-; draw_high_score_table: the placeholder table (see str_hs_title/str_hs1-5
-; above) - callers clear_screen first, same convention as draw_title_screen.
+; --- Real high-score table (src/HIGH.asm's ahigh/gnam/pht) ---
+;
+; HS_TITLE_ROW/COL: "HIGH SCORES" heading, drawn once, static, same
+; table-free approach the score bar/body text use for a one-off string.
+; HS_ROW0/HS_ROW_STRIDE/HS_COL: 8 real table rows (not today's 5 - real
+; ti7/ti10 both index 8 rows), 2 screen rows apart. Column/row numbers
+; are a first pass, not measured against anything - check them
+; alongside the rest of the HUD once this is actually on screen, same
+; as every other position in this file that started as a first guess.
+HS_TITLE_ROW = 3
+HS_TITLE_COL = 12
+HS_ROW0      = 6
+HS_ROW_STRIDE = 2
+HS_COL       = 4
+
+; hs_row_bitmap_lo/hi, hs_row_matrix_lo/hi: precomputed per-row
+; destination addresses (8 entries, row X's screen row = HS_ROW0 +
+; X*HS_ROW_STRIDE) - avoids a runtime row*40 multiply for something
+; that never changes after assembly.
+hs_row_bitmap_lo:
+.repeat 8, I
+ .byte <($6000+(HS_ROW0+I*HS_ROW_STRIDE)*320+HS_COL*8)
+.endrepeat
+hs_row_bitmap_hi:
+.repeat 8, I
+ .byte >($6000+(HS_ROW0+I*HS_ROW_STRIDE)*320+HS_COL*8)
+.endrepeat
+hs_row_matrix_lo:
+.repeat 8, I
+ .byte <($4000+(HS_ROW0+I*HS_ROW_STRIDE)*40+HS_COL)
+.endrepeat
+hs_row_matrix_hi:
+.repeat 8, I
+ .byte >($4000+(HS_ROW0+I*HS_ROW_STRIDE)*40+HS_COL)
+.endrepeat
+
+; hs_row_buf: one row's built glyph-code string - rank digit(1), space,
+; 4 score digits, trailing fixed units digit, space, 10 name glyphs,
+; $FF terminator (18 glyphs + terminator, matching hs_build_row below).
+hs_row_buf:
+ .res 19
+
+; hs_seen_nonzero: scratch for hs_build_row's leading-zero-as-space
+; suppression (real HIGH.asm's ah2/ph2/ph3) - reset per row, not
+; persistent state.
+hs_seen_nonzero:
+ .byte 0
+hbr_row:
+ .byte 0
+hbr_base:
+ .byte 0
+
+; hbr_emit_digit: A = a digit value (0-9) in. Real HIGH.asm shows a
+; leading zero as a blank space rather than "0", stopping once any
+; nonzero digit has been seen (hs_seen_nonzero) - after that every
+; remaining digit, even a 0, shows literally. A fresh (never-beaten)
+; row is therefore all spaces, not "0000000" - looks like an empty
+; slot, which is the point.
+hbr_emit_digit:
+    cmp #0
+    bne hed_nonzero
+    lda hs_seen_nonzero
+    bne hed_zero_show
+    lda #38
+    rts
+hed_zero_show:
+    lda #0
+    rts
+hed_nonzero:
+    pha
+    lda #1
+    sta hs_seen_nonzero
+    pla
+    rts
+
+; hs_build_row: A = row (0-7). Fills hs_row_buf with that row's real
+; glyph-code string, freshly built from hs_score_digits/hs_names each
+; call (same approach redraw_score already uses for the live score) -
+; matching score_digits' own tens/hundreds/thousands/ten-thousands
+; layout (index 3 is most significant, shown first). Clobbers X/Y.
+hs_build_row:
+    sta hbr_row
+    clc
+    adc #1
+    sta hs_row_buf                ; rank digit 1-8 - row is always 0-7,
+                                    ; so this never needs its own
+                                    ; suppression check
+    lda #38
+    sta hs_row_buf+1               ; space
+
+    lda hbr_row
+    asl a
+    asl a
+    sta hbr_base                   ; row*4 - hs_score_digits row base
+
+    lda #0
+    sta hs_seen_nonzero
+
+    ldy hbr_base
+    lda hs_score_digits+3,y
+    jsr hbr_emit_digit
+    sta hs_row_buf+2
+    ldy hbr_base
+    lda hs_score_digits+2,y
+    jsr hbr_emit_digit
+    sta hs_row_buf+3
+    ldy hbr_base
+    lda hs_score_digits+1,y
+    jsr hbr_emit_digit
+    sta hs_row_buf+4
+    ldy hbr_base
+    lda hs_score_digits+0,y
+    jsr hbr_emit_digit
+    sta hs_row_buf+5
+
+    lda #0                          ; trailing fixed units digit - same
+    jsr hbr_emit_digit                ; suppression as the real digits
+    sta hs_row_buf+6
+
+    lda #38
+    sta hs_row_buf+7                ; space before the name
+
+    lda hbr_row
+    jsr hs_name_row_offset
+    tay
+    ldx #0
+hbr_name_loop:
+    lda hs_names,y
+    sta hs_row_buf+8,x
+    iny
+    inx
+    cpx #10
+    bne hbr_name_loop
+
+    lda #$FF
+    sta hs_row_buf+18
+    rts
+
+; hs_name_row_offset: A = row (0-7) in, returns A = row*10 (byte offset
+; into hs_names). Clobbers temp1.
+hs_name_row_offset:
+    sta temp1
+    asl a
+    asl a
+    asl a
+    clc
+    adc temp1
+    clc
+    adc temp1
+    rts
+
+hdr_saved_x:
+ .byte 0
+
+; hs_draw_row: X = row (0-7). Clears that row's full 27-cell span (18
+; glyphs at 1.5 cells each, the fixed maximum width this string can
+; ever reach) before drawing - needed because this row gets redrawn
+; with different NAME content as the player types (see hs_enter_name),
+; and print_bitmap_line only ever ORAs new glyph bits in (same reason
+; redraw_score clears the score field before every redraw). Screen-
+; matrix needs no clear - print_bitmap_line overwrites it outright
+; (STA, not ORA) per character already.
+hs_draw_row:
+    stx hdr_saved_x
+    lda hs_row_bitmap_lo,x
+    sta temp3
+    lda hs_row_bitmap_hi,x
+    sta temp3+1
+    ldy #0
+    lda #0
+hdr_clear_loop:
+    sta (temp3),y
+    iny
+    cpy #216
+    bne hdr_clear_loop
+
+    ldx hdr_saved_x
+    txa
+    jsr hs_build_row
+    ldx hdr_saved_x
+
+    lda #<hs_row_buf
+    sta temp2
+    lda #>hs_row_buf
+    sta temp2+1
+    lda hs_row_bitmap_lo,x
+    sta temp3
+    lda hs_row_bitmap_hi,x
+    sta temp3+1
+    lda hs_row_matrix_lo,x
+    sta temp4
+    lda hs_row_matrix_hi,x
+    sta temp4+1
+    lda #3                        ; cyan, matches the old placeholder
+    sta colour
+    jmp print_bitmap_line
+
+; draw_high_score_table: real HIGH.asm's pht - the "HIGH SCORES"
+; heading (static, drawn once) then all 8 real rows, each freshly built
+; from hs_score_digits/hs_names (not fixed compile-time strings like
+; the old placeholder). Callers clear_screen first, same convention as
+; draw_title_screen.
 draw_high_score_table:
+    lda #<str_hs_title
+    sta temp2
+    lda #>str_hs_title
+    sta temp2+1
+    lda #<($6000+(HS_TITLE_ROW*40+HS_TITLE_COL)*8)
+    sta temp3
+    lda #>($6000+(HS_TITLE_ROW*40+HS_TITLE_COL)*8)
+    sta temp3+1
+    lda #<($4000+HS_TITLE_ROW*40+HS_TITLE_COL)
+    sta temp4
+    lda #>($4000+HS_TITLE_ROW*40+HS_TITLE_COL)
+    sta temp4+1
+    lda #7
+    sta colour
+    jsr print_bitmap_line
+
     ldx #0
 dhs_loop:
-    lda high_score_table,x
-    sta temp2
-    lda high_score_table+1,x
-    sta temp2+1
-    lda high_score_table+2,x
-    sta temp3
-    lda high_score_table+3,x
-    sta temp3+1
-    lda high_score_table+4,x
-    sta temp4
-    lda high_score_table+5,x
-    sta temp4+1
-    lda high_score_table+6,x
-    sta colour
-    stx dtt_saved_x
-    jsr print_bitmap_line
-    ldx dtt_saved_x
-    txa
-    clc
-    adc #7
-    tax
-    cpx #(6*7)
+    jsr hs_draw_row
+    ldx hdr_saved_x
+    inx
+    cpx #8
     bne dhs_loop
     rts
 
-; Positions below (rows 6/9/11/13/15/17, cols 12-14) are a first guess,
-; not measured against anything - confirmed needing adjustment once
-; there's a look at it alongside the score bar/flags/lives it now shares
-; the screen with.
-high_score_table:
-    .word str_hs_title, $6000+(6*40+14)*8,  $4000+6*40+14
-    .byte 7                                              ; yellow
-    .word str_hs1,       $6000+(9*40+12)*8,  $4000+9*40+12
-    .byte 3                                              ; cyan
-    .word str_hs2,       $6000+(11*40+12)*8, $4000+11*40+12
-    .byte 3
-    .word str_hs3,       $6000+(13*40+12)*8, $4000+13*40+12
-    .byte 3
-    .word str_hs4,       $6000+(15*40+12)*8, $4000+15*40+12
-    .byte 3
-    .word str_hs5,       $6000+(17*40+12)*8, $4000+17*40+12
-    .byte 3
+; hs_cmp_result: scratch for hs_compare_row.
+hs_cmp_result:
+ .byte 0
+
+; hs_compare_row: Y = row (0-7) in, preserved on exit. Sets
+; hs_cmp_result=1 if the live score_digits is STRICTLY greater than
+; hs_score_digits[Y] (a 4-byte compare, most-significant index (3)
+; first, matching score_digits' own layout), else 0.
+hs_compare_row:
+    tya
+    pha
+    asl a
+    asl a
+    clc
+    adc #<hs_score_digits
+    sta temp2
+    lda #>hs_score_digits
+    adc #0
+    sta temp2+1
+    lda #0
+    sta hs_cmp_result
+    ldy #3
+hcr_loop:
+    lda score_digits,y
+    cmp (temp2),y
+    beq hcr_next
+    bcc hcr_done
+    lda #1
+    sta hs_cmp_result
+    bne hcr_done
+hcr_next:
+    dey
+    bpl hcr_loop
+hcr_done:
+    pla
+    tay
+    rts
+
+hti_insert_row:
+ .byte 0
+hti_src_off:
+ .byte 0
+hti_dst_off:
+ .byte 0
+hti_copy_count:
+ .byte 0
+
+; hs_try_insert: real HIGH.asm's ahigh. Skipped entirely in demo mode -
+; matches real ahigh's own "BITdemo_flag:BMIahdem" check (a demo game
+; never qualifies), but as "demo_flag != 0" (bne), not BMI/negative:
+; this port's demo_flag is a plain 0/1 flag (see start_demo/
+; manual_game_start), not the real source's 0/&FF - every OTHER
+; demo_flag check in this file already uses beq/bne, not bmi/bpl, for
+; the same reason (see process_demo/demo_process_fire/
+; handle_ship_input above). Getting this wrong would let a demo game's
+; death try to run name entry - which demo never provides keystrokes
+; for - hanging the attract-mode loop indefinitely on the very first
+; demo game that scores any points against an empty table.
+;
+; Otherwise walks the table top to bottom for the first row the just-
+; finished score beats, shifts every row from there down by one (real
+; ah6/ah7's block-shift), writes the new score into the freed row,
+; blanks its name, and runs name entry there. If the score doesn't beat
+; any row, does nothing - matches ahigh only running gnam/pht on an
+; actual insertion.
+hs_try_insert:
+    lda demo_flag
+    bne hti_none
+    ldy #0
+hti_loop:
+    jsr hs_compare_row
+    lda hs_cmp_result
+    bne hti_insert
+    iny
+    cpy #8
+    bne hti_loop
+hti_none:
+    rts
+
+hti_insert:
+    sty hti_insert_row
+    ldx #6
+hti_shift_loop:
+    cpx hti_insert_row
+    bcc hti_shift_done
+
+    txa                          ; 4-byte score row: src=X*4, dst=src+4
+    asl a
+    asl a
+    sta hti_src_off
+    clc
+    adc #4
+    sta hti_dst_off
+    lda #4
+    sta hti_copy_count
+hti_ss_loop:
+    ldy hti_src_off
+    lda hs_score_digits,y
+    ldy hti_dst_off
+    sta hs_score_digits,y
+    inc hti_src_off
+    inc hti_dst_off
+    dec hti_copy_count
+    bne hti_ss_loop
+
+    txa                          ; 10-byte name row: src=X*10, dst=src+10
+    jsr hs_name_row_offset
+    sta hti_src_off
+    clc
+    adc #10
+    sta hti_dst_off
+    lda #10
+    sta hti_copy_count
+hti_sn_loop:
+    ldy hti_src_off
+    lda hs_names,y
+    ldy hti_dst_off
+    sta hs_names,y
+    inc hti_src_off
+    inc hti_dst_off
+    dec hti_copy_count
+    bne hti_sn_loop
+
+    dex
+    jmp hti_shift_loop
+
+hti_shift_done:
+    lda hti_insert_row
+    asl a
+    asl a
+    tay
+    lda score_digits+0
+    sta hs_score_digits,y
+    iny
+    lda score_digits+1
+    sta hs_score_digits,y
+    iny
+    lda score_digits+2
+    sta hs_score_digits,y
+    iny
+    lda score_digits+3
+    sta hs_score_digits,y
+
+    lda hti_insert_row
+    jsr hs_name_row_offset
+    sta hti_dst_off
+    lda #10
+    sta hti_copy_count
+hti_blank_loop:
+    ldy hti_dst_off
+    lda #38
+    sta hs_names,y
+    inc hti_dst_off
+    dec hti_copy_count
+    bne hti_blank_loop
+
+    ldx hti_insert_row
+    jsr hs_enter_name
+    rts
+
+; hsk_col_mask: CIA1 $DC00 column-select masks, same convention as
+; check_return_key/check_space_key/check_pause_key/handle_ship_input
+; above (clear one bit to select that column, then read $DC01's row
+; bits - 0=pressed).
+hsk_col_mask:
+ .byte $FE,$FD,$FB,$F7,$EF,$DF,$BF,$7F
+
+; key_glyph_table: standard C64 keyboard matrix position (col*8+row) ->
+; real glyph code (digit=value, letter=10+0-indexed position, space=38
+; - the scheme from the font-code fix), or a sentinel: $FD=DEL/INST
+; (backspace), $FE=RETURN (finish), $FF=anything else (ignored). Matrix
+; layout cross-checked against this file's own existing key checks:
+; col0/row1=RETURN (check_return_key), col7/row4=SPACE (check_space_key),
+; col5/row1=P (check_pause_key) all agree with the table below.
+key_glyph_table:
+ .byte $FD,$FE,$FF,$FF,$FF,$FF,$FF,$FF   ; col0: DEL,RETURN,CRSR_R,F7,F1,F3,F5,CRSR_D
+ .byte 3,32,10,4,35,28,14,$FF             ; col1: 3,W,A,4,Z,S,E,SHIFT
+ .byte 5,27,13,6,12,15,29,33              ; col2: 5,R,D,6,C,F,T,X
+ .byte 7,34,16,8,11,17,30,31              ; col3: 7,Y,G,8,B,H,U,V
+ .byte 9,18,19,0,22,20,24,23              ; col4: 9,I,J,0,M,K,O,N
+ .byte $FF,25,21,$FF,$FF,$FF,$FF,$FF      ; col5: +,P,L,-,.,:,@,,
+ .byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF    ; col6: POUND,*,;,HOME,SHIFT,=,UP,/
+ .byte 1,$FF,$FF,2,38,$FF,26,$FF          ; col7: 1,LEFT,CTRL,2,SPACE,C=,Q,RUNSTOP
+
+hs_last_key:
+ .byte $FF
+hsk_found_pos:
+ .byte 0
+
+; hs_scan_key: returns A = a real glyph code, $FE (RETURN) or $FD (DEL)
+; if a NEW key press is detected this call (edge-triggered against
+; hs_last_key, the same debounce idea fire_key_prev etc. already use,
+; just tracking a matrix position instead of one fixed key), else
+; A=$FF. Only the first held key found (scanning columns 0-7, rows 0-7
+; within each) is reported - fine for name entry, where one key at a
+; time is the normal case.
+hs_scan_key:
+    ldx #0
+hsk_col_loop:
+    lda hsk_col_mask,x
+    sta $DC00
+    lda $DC01
+    ldy #0
+hsk_row_loop:
+    lsr a
+    bcs hsk_row_next
+    txa
+    asl a
+    asl a
+    asl a
+    sta hsk_found_pos
+    tya
+    clc
+    adc hsk_found_pos
+    sta hsk_found_pos
+    jmp hsk_check_edge
+hsk_row_next:
+    iny
+    cpy #8
+    bne hsk_row_loop
+    inx
+    cpx #8
+    bne hsk_col_loop
+
+    lda #$FF
+    sta hs_last_key
+    rts
+
+hsk_check_edge:
+    lda hsk_found_pos
+    cmp hs_last_key
+    beq hsk_no_new
+    sta hs_last_key
+    tax
+    lda key_glyph_table,x
+    rts
+hsk_no_new:
+    lda #$FF
+    rts
+
+hs_enter_row:
+ .byte 0
+hs_name_cursor:
+ .byte 0
+
+; hs_store_name_char: A = glyph to store. Writes it to hs_names at
+; (hs_enter_row, hs_name_cursor) - does NOT move the cursor itself
+; (hs_enter_name does that, since backspace also uses this to blank a
+; slot without advancing).
+hs_store_name_char:
+    pha
+    lda hs_enter_row
+    jsr hs_name_row_offset
+    clc
+    adc hs_name_cursor
+    tay
+    pla
+    sta hs_names,y
+    rts
+
+; hs_enter_name: real HIGH.asm's gnam. X = row (0-7) to fill (already
+; blanked to spaces by hs_try_insert). Live letter-by-letter entry -
+; A-Z/0-9/space accepted up to 10 characters, DEL steps back and blanks
+; the erased slot, RETURN finishes (only once at least 1 character has
+; been typed, matching gnam's own "LDXwavbase:...CPY#10:BEQgn3" - an
+; empty name can't be submitted). Redraws just this one row
+; (hs_draw_row) after each accepted change, not the whole table.
+hs_enter_name:
+    stx hs_enter_row
+    lda #0
+    sta hs_name_cursor
+    lda #$FF
+    sta hs_last_key
+
+hen_loop:
+    jsr movestars
+    jsr refresh_music
+    lda #250
+hen_wait_raster:
+    cmp $D012
+    bne hen_wait_raster
+
+    jsr hs_scan_key
+    cmp #$FF
+    beq hen_loop
+    cmp #$FE
+    beq hen_finish_check
+    cmp #$FD
+    beq hen_backspace
+
+    ldy hs_name_cursor
+    cpy #10
+    bcs hen_loop
+    jsr hs_store_name_char
+    inc hs_name_cursor
+    ldx hs_enter_row
+    jsr hs_draw_row
+    jmp hen_loop
+
+hen_finish_check:
+    lda hs_name_cursor
+    beq hen_loop
+    rts
+
+hen_backspace:
+    lda hs_name_cursor
+    beq hen_loop
+    dec hs_name_cursor
+    lda #38
+    jsr hs_store_name_char
+    ldx hs_enter_row
+    jsr hs_draw_row
+    jmp hen_loop
 
 score_bar_table:
     .word str_scr,      $6000+3*8,               $4000+3
@@ -5857,23 +6780,10 @@ str_k:
 str_s:
     .byte 28,$FF                                    ; S (CHARP.asm sound_letter)
 
-; Placeholder high-score table text - HIGH.asm's real one (hsnum/hstxt,
-; up to 10-char names + 7-digit scores, ahigh/pht) reads and writes
-; persistent score data we don't have yet ("no persistent storage yet -
-; separate concern" per the demo-mode plan). These are fixed strings
-; standing in for that until scoring itself exists.
+; str_hs_title: the real HIGH SCORES table's static heading (real rows
+; are built dynamically at draw time now - see hs_build_row).
 str_hs_title:
     .byte 17,18,16,17,38,28,12,24,27,14,28,$FF        ; HIGH SCORES
-str_hs1:
-    .byte 1,38,20,14,31,38,1,0,0,0,0,0,$FF            ; 1 KEV 100000
-str_hs2:
-    .byte 2,38,28,30,25,38,0,8,0,0,0,0,$FF            ; 2 SUP 080000
-str_hs3:
-    .byte 3,38,12,6,4,38,0,6,0,0,0,0,$FF              ; 3 C64 060000
-str_hs4:
-    .byte 4,38,10,10,10,38,0,4,0,0,0,0,$FF            ; 4 AAA 040000
-str_hs5:
-    .byte 5,38,11,11,11,38,0,2,0,0,0,0,$FF            ; 5 BBB 020000
 
 ; LEFT_TABLE/RIGHT_TABLE: indexed by a source glyph row's top 5 bits (its
 ; 5 real pixel columns, srcbyte>>3, giving an index 0-31), giving the

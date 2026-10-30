@@ -1,12 +1,8 @@
-Galaforce1BBC.*
-O.*
-*.list
-*.PRG
+build/
+tools.cfg
 *.o
+*.PRG
+*.list
 map.txt
-G
-d
-f
-*.bin
-*.tar
 *.png
+*.tar

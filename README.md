@@ -1,42 +1,40 @@
-# Galaforce ( BBC Micro )
+# Galaforce 1 - C64 port (work in progress)
 
-**Version V1.00**
+Original BBC Micro game (c) Kevin Edwards 1985-2019, published by Superior Software as *Galaforce*.
+The BBC source is in `src/` (beebasm syntax, unmodified, reference only) and also at
+`../Galaforce1BBC`. This is a port to the Commodore 64.
 
-(c) Kevin Edwards 1985-2019
+## Building
 
-![Screenshot](screenshot.png)
+    cp tools.cfg.tmpl tools.cfg    # set CC65_HOME if cc65 is not on PATH
+    make                           # build/GalaForce1-c64.PRG (+ .list, map.txt)
+    make run                       # build and run in VICE (x64sc)
+    make clean
 
-In 1985 I began writing a shoot-em-up game for the BBC Micro and Electron home computers. This game was published by Superior Software in 1986 under the name Galaforce.
+Needs cc65 (`cl65`) and python3.
 
-The game is written entirely in 6502 assembly language. The target computers had only 32K bytes of RAM. Of which 20K bytes was required for the video memory ( BBC Micro ) and 10K bytes on the Electron.
+## Layout
 
-Over 30 years have passed and I have decided to preserve this code for the future by making it public.
+| | |
+|---|---|
+| `src/` | the original BBC source: reference only, not assembled |
+| `Master-c64.mak.asm` | top-level file for the C64 build |
+| `src-c64/INIT.asm` | the game: boot, title/high-score/demo cycle, game loop, ship, aliens, waves, collisions, score, music |
+| `src-c64/STARS.asm` | star field (a rewrite for the C64, not a translation) |
+| `src-c64/ZPWORK.asm`, `ABSWORK.asm`, `c64.inc` | zero-page and absolute variables, KERNAL/VIC equates |
+| `galaforce1-c64.cfg` | ld65 memory layout |
+| `object/` | BBC font and graphics data (`O.SPFONT_C64` is generated from `O.SPFONT` by `tools/rotate_font.py`) |
+| `bas_extra/LOADER.bas.txt` | the BBC loader; its `ENVELOPE` lines define the music envelopes |
 
-Originally, the BBC BASIC in-line assembler was used to build the code. However, I decided to make the codebase assemble using 'beebasm' on a PC. This required me to re-work the original source code. This involved de-tokenizing all of the BBC BASIC files and adapting the code to use beebasm friendly directives / commands. This now allows Visual Code or other IDEs to be used to build the code in a nice development environment.
+## Display
 
-The code here is for the BBC Micro version of the game. I had slightly different code for the Electron and Master 128 versions. I hope to make these available in the future when I get more spare time.
+Everything is drawn into the VIC-II multicolour bitmap (VIC bank 1: screen matrix `$4000`, bitmap `$6000`),
+160 x 200 colour pixels, which matches the BBC's MODE 2 pixel grid horizontally. The BBC screen is 256 lines
+high, so the vertical layout has to be squeezed to 200.
 
-I hope it is useful to people who have an interest in 6502 assembly language programming and to those who wish to know how games were made in the 1980s.
+## Status
 
-
-# Build Tools required ( PC )
-
-To build the game you first need to install the following tools:-
-
-* [beebasm](https://github.com/stardot/beebasm)
-
-
-# Build Steps ( PC )
-
-Run 'make.bat' from a command prompt whilst in the project's root folder. This will assemble the code and output 'Galaforce1BBC.ssd' in the same folder. This disk image file can be loaded by many different BBC Micro Emulators, including B-em and BeebEm.
-
-Alternatively, you could use 'Visual Studio Code' with the 'Beeb VSC' extension. I hope to include the required workspace and .json files required to do this.
-
-
-# Additional Notes
-
-You can find me on Twitter @KevEdwardsRetro where I ramble on about all kinds of retro computer and video game things. Please drop by and say hello.
-
-Many thanks to Rich Talbot-Watkins for his great work on BeebAsm.
-
-Thank you for reading this far.
+The game logic is a reimplementation that follows the BBC source (alien types, spawn waves, flight patterns,
+scoring, lives, high scores), not a line-by-line translation; comments in `INIT.asm` cite the BBC routines.
+Known gaps: sound effects (`mk_sound` is a stub), the music is an approximation (amplitude envelopes only, PAL
+frequency table), and the rendering of overlapping objects is not yet right.
