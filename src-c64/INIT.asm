@@ -98,6 +98,7 @@ exec:
     lda #$00
     sta $D021             ; background black
 
+    jsr spr_init               ; sprite multiplexer for the aliens (SPRMUX.asm); enables interrupts
     jsr clear_screen
     jsr draw_title_screen
     jsr star_init
@@ -119,6 +120,7 @@ exec:
 ; too, or show_high_scores (which draws them) would show whatever the
 ; just-finished game ended on instead of the attract-mode defaults.
 title_wait_loop:
+    jsr spr_reset
     lda #3
     sta lives_count
     lda #1
@@ -142,9 +144,7 @@ twl_wait_raster:
     bne twl_wait_raster
     jsr movestars
     jsr refresh_music
-    jsr check_space_key    ; TEMPORARY: space -> demo directly, see the
-    beq start_demo           ; note above check_space_key
-    jsr check_return_key
+    jsr check_start_key
     beq manual_game_start
     inc title_frame_count
     bne twl_loop
@@ -169,9 +169,7 @@ hs_wait_raster:
     bne hs_wait_raster
     jsr movestars
     jsr refresh_music
-    jsr check_space_key    ; TEMPORARY: space -> demo directly, see the
-    beq start_demo           ; note above check_space_key
-    jsr check_return_key
+    jsr check_start_key
     beq manual_game_start
     inc title_frame_count
     bne hs_loop
@@ -203,6 +201,7 @@ manual_game_start:
 ; now-blank game screen (clear_screen wiped them along with everything
 ; else). ---
 game_start:
+    jsr spr_reset
     jsr clear_screen
     jsr star_init
 
@@ -233,21 +232,8 @@ game_start:
     sta ship_row
     jsr draw_ship
 
-    ; Prime fire_key_prev with RETURN's actual current state, so if the
-    ; player started the game by pressing RETURN (still held on this
-    ; very first frame), fire_bullet_if_requested's edge trigger sees it
-    ; as "already down", not a fresh press, and doesn't fire immediately.
-    lda #$FE               ; clear bit0: select column 0 (RETURN's column)
-    sta $DC00
-    lda $DC01
-    and #$02                 ; row bit 1 = RETURN
-    beq gs_return_held
     lda #0
-    jmp gs_store_fire_prev
-gs_return_held:
-    lda #1
-gs_store_fire_prev:
-    sta fire_key_prev
+    sta fire_delay
 
     lda #0                  ; tune 0 = Game Start (see start_tune)
     jsr start_tune
@@ -258,6 +244,8 @@ gl_wait_raster:
     cmp $D012
     bne gl_wait_raster
 
+    jsr spr_build              ; next frame's sprite list, from the alien pool as the last frame left it
+
     jsr check_escape_key
     bne gl_no_escape
     jmp game_loop_escape     ; out of branch range - see pas_next's
@@ -266,7 +254,7 @@ gl_no_escape:
 
     ; P toggles a full freeze (stars/music/gameplay all skipped below) -
     ; added for taking clean screenshots, not a real BBC feature. Edge-
-    ; detected the same way as the SPACE wave-debug key, so holding P
+    ; edge-detected, so holding P
     ; down doesn't just flicker the pause state every frame.
     jsr check_pause_key
     beq gl_pause_pressed
@@ -291,22 +279,6 @@ gl_not_paused:
     jsr refresh_music
 
     lda game_state
-    cmp #GS_PLAYING
-    bne gl_no_wave_debug
-    jsr check_space_key
-    beq gl_wave_debug_pressed
-    lda #0
-    sta wave_debug_key_prev
-    jmp gl_no_wave_debug
-gl_wave_debug_pressed:
-    lda wave_debug_key_prev
-    bne gl_no_wave_debug        ; already held - only fire on the press
-    lda #1
-    sta wave_debug_key_prev
-    jsr advance_to_next_wave
-gl_no_wave_debug:
-
-    lda game_state
     cmp #GS_SHIP_EXPLODING
     beq gl_exploding
 
@@ -328,7 +300,6 @@ gl_no_wave_debug:
     bne game_loop_no_wave_check
     jsr try_load_next_group
 game_loop_no_wave_check:
-    jsr process_alien_spawns
     jsr alien_move_tick
     jsr check_bullet_alien_collisions
     jsr check_alien_bullet_ship_collision
@@ -411,20 +382,7 @@ csk_pressed:
     lda #0
     rts
 
-; check_space_key/check_return_key: same column/row masks as
-; check_start_key, split apart so title_wait_loop/show_high_scores can
-; currently tell SPACE and RETURN apart - TEMPORARY: for now SPACE jumps
-; straight into the demo and RETURN starts a real game, so the demo
-; doesn't need the full idle-timeout wait to reach for testing.
-; check_start_key above is unused while this is wired in, not removed -
-; this is meant to come back out once the demo's been looked at.
-check_space_key:
-    lda #$7F              ; clear bit7: select column 7 (SPACE's column)
-    sta $DC00
-    lda $DC01
-    and #$10                ; row bit 4 = SPACE
-    rts
-
+; check_return_key: Z set if RETURN is held (the fire key).
 check_return_key:
     lda #$FE              ; clear bit0: select column 0 (RETURN's column)
     sta $DC00
@@ -618,14 +576,6 @@ bullet_row:
  .res BULLET_COUNT
 bullet_col:
  .res BULLET_COUNT
-fire_key_prev:
- .byte 0
-; wave_debug_key_prev: press-edge debounce for the SPACE-forces-next-
-; wave debug key (see game_loop/advance_to_next_wave) - TEMPORARY, same
-; status as the SPACE/RETURN demo-vs-play shortcuts already in this
-; file, meant for testing waves 1-15 without waiting out a full wave 0.
-wave_debug_key_prev:
- .byte 0
 ; game_paused/pause_key_prev: P-toggles-freeze debug feature (see
 ; game_loop) for taking clean screenshots - not a real BBC feature.
 game_paused:
@@ -693,34 +643,32 @@ dbx_loop:
     bne dbx_loop
     rts
 
-; fire_bullet_if_requested: RETURN fires, edge-triggered (only on a
-; fresh press, not held down) into the first free slot of the pool -
-; SPACE is reserved for starting the game and is never read here. The
-; edge trigger is also what stops a bullet firing the instant the game
-; starts: fire_key_prev is primed with RETURN's actual state right
-; before game_loop begins (see there), so "still held from starting the
-; game" doesn't look like a new press.
-; fire_bullet_if_requested: the manual (real key) path - edge-detects
-; RETURN, then calls spawn_player_bullet. During demo, demo_process_fire
-; (see below) calls spawn_player_bullet directly on its own timer,
-; bypassing the key check entirely - matches BOMBS1.asm's own
-; "LDAdemo_flag:BMIbomb11" (demo mode skips the key/joystick read and
-; just tries to fire whenever off cooldown).
+; fire_bullet_if_requested: BOMBS1.asm's process_my_bombs, the fire half. Holding RETURN auto-repeats: while it is
+; down and fire_delay (the BBC's bombdel) has run out, spawn_player_bullet fires and sets the delay to
+; FIRE_DELAY passes of the game loop; the delay counts down once per pass, and releasing the key clears it so
+; a fresh press fires at once. A full bullet pool leaves the delay alone, as in the original. During the demo
+; demo_process_fire calls spawn_player_bullet directly on its own timer.
+FIRE_DELAY = 7                   ; "LDA#7:STAbombdel" (the original's comment: "WAS 3!")
+fire_delay:
+ .byte 0
+
 fire_bullet_if_requested:
+    lda fire_delay
+    beq fbr_read
+    dec fire_delay
+fbr_read:
     lda #$FE               ; clear bit0: select column 0 (RETURN's column)
     sta $DC00
     lda $DC01
     and #$02                 ; row bit 1 = RETURN
     beq fbr_held
     lda #0
-    sta fire_key_prev
+    sta fire_delay           ; released: the next press fires at once
     rts
 fbr_held:
-    lda fire_key_prev
-    bne fbr_done             ; already down last frame - not a new press
-    lda #1
-    sta fire_key_prev
-    jsr spawn_player_bullet
+    lda fire_delay
+    bne fbr_done
+    jmp spawn_player_bullet  ; sets fire_delay if a slot was free
 fbr_done:
     rts
 
@@ -759,6 +707,8 @@ spb_row_set:
     adc #1                   ; middle of the ship's 3 cells
     sta bullet_col,x
     jsr draw_bullet_x
+    lda #FIRE_DELAY
+    sta fire_delay
     lda #0                  ; sound 0 - placeholder until real effect data exists
     jsr mk_sound
     rts
@@ -774,7 +724,8 @@ spb_row_set:
 ; room to slow back down as more real complexity (remaining alien
 ; sprites, sound effects, more wave variety) lands and changes the
 ; overall pace again.
-BULLET_MOVE_SLOWDOWN = 2
+BULLET_MOVE_SLOWDOWN = 1         ; BOMBS1.asm moves a bullet 8 lines every pass; at 2 the bullets were 2.3x too slow
+                                 ; against the original's alien rate (see alien_move_tick) to clear a wave
 bullet_move_count:
  .byte 0
 
@@ -1277,6 +1228,10 @@ dab_type:
  .byte 0
 
 draw_alien_x:
+    lda swarm_flag
+    bne dax_bitmap
+    rts                         ; sprites draw the aliens (SPRMUX.asm)
+dax_bitmap:
     lda alien_disp_row,x
     sta temp1
     jsr is_row_protected
@@ -1556,27 +1511,6 @@ is_cell_covered:
     lda #$FF
     sta cell_check_covering_slot
 
-    lda cell_check_exclude_kind
-    beq icc_skip_ship          ; kind 0 - the ship is asking, don't check
-                                ; the ship against itself
-    lda cell_check_col
-    cmp ship_col
-    bcc icc_skip_ship
-    sec
-    sbc ship_col
-    cmp #3
-    bcs icc_skip_ship
-    lda cell_check_row
-    cmp ship_row
-    bcc icc_skip_ship
-    sec
-    sbc ship_row
-    cmp #2
-    bcs icc_skip_ship
-    lda #1
-    sta cell_check_result
-    jmp icc_done               ; covering_slot stays $FF - covered by
-                                 ; the ship, not an alien
 icc_skip_ship:
     ldx #0
 icc_alien_loop:
@@ -2397,14 +2331,17 @@ EXPLOSION_FRAME_COUNT = 6   ; explosion_frame_0..5 - see draw_explosion_here
 ; init_alien_hp: X = alien slot (alien_type,X already set). Sets
 ; alien_hp,X from alien_hp_table and clears alien_exploding,X - shared
 ; by pas_spawn and asc_spawn, both of which need identical fresh-spawn
-; bookkeeping. Y is free here (unlike X, which is busy holding the pool
-; slot), so this is a plain indexed lookup, not a dispatch.
+; bookkeeping. Preserves X and Y (callers keep indexes in both).
 init_alien_hp:
-    lda #0
-    sta alien_exploding,x
+    tya                      ; preserve Y: pas_spawn keeps its spawn-table offset in it and asc_spawn the
+    pha                      ; parent's slot (both used Y after this call, and got the alien's type instead -
+    lda #0                   ; wrong flight pattern for every spawned alien, a garbage one for some, which
+    sta alien_exploding,x    ; sent the pattern interpreter into an endless loop)
     ldy alien_type,x
     lda alien_hp_table,y
     sta alien_hp,x
+    pla
+    tay
     rts
 
 ; alien_explode_tick: X = alien slot, already known to be exploding.
@@ -2431,6 +2368,8 @@ alien_explode_tick:
     lda alien_explode_timer,x
     cmp #EXPLOSION_FRAME_COUNT
     bcs aet_finish
+    lda swarm_flag
+    beq aet_advance             ; sprites show the explosion frames
 
     lda alien_disp_row,x
     sta temp1
@@ -2656,6 +2595,12 @@ wave_off:
 ; start of this wave's group list. No longer expands any groups itself
 ; - try_load_next_group does that now, one real wave-list entry at a
 ; time, same as the real ALIENS1.asm.
+; swarm_flag: 1 while the current wave's spawn group 45 (the 32-alien swarm) is on. Aliens are sprites
+; (SPRMUX.asm) except then, when they are drawn in the bitmap as before (the rows are 19 lines apart,
+; closer than a sprite can be re-used).
+swarm_flag:
+ .byte 0
+
 init_alien_wave:
     ldx #0
 iaw_clear:
@@ -2682,6 +2627,7 @@ iaw_clear_slots:
     sta alien_live_count
     sta alien_bullet_live_count
     sta wave_off
+    sta swarm_flag
 
     lda c64_curwave
     and #15
@@ -2746,6 +2692,8 @@ tlng_wave_not_done:
     ; on the next wave transition.
     cpx #45
     bne tlng_not_special
+    lda #1
+    sta swarm_flag            ; the 32-alien swarm is drawn in the bitmap, not as sprites
     lda #33
     sta alien_pool_max
     lda #32
@@ -2811,7 +2759,7 @@ iaw_row_to_offset:               ; A = master row index -> temp1 = A*8
     sta temp1
     rts
 
-; process_alien_spawns: called once per frame. For each OCCUPIED
+; process_alien_spawns: called once per cycle through the pool (alien_move_tick). For each OCCUPIED
 ; pat_st slot: counts its delay down, and on reaching 0, spawns one
 ; alien into the first free pool slot (dropping the spawn if the pool's
 ; full) and reloads the delay - real ALIENS2.asm's proc1/proc6/proc4/
@@ -2941,9 +2889,7 @@ c64_curwave:
 
 ; advance_to_next_wave: the actual wave-advance body (c64_curwave++,
 ; Zone tune, flag-count update, reset for the new wave) - called by
-; try_load_next_group (the real trigger) and by gl_force_next_wave (a
-; TEMPORARY debug key, see game_loop, to reach waves 1-15 for testing
-; without waiting out a full wave 0).
+; try_load_next_group.
 advance_to_next_wave:
     inc c64_curwave
     lda #1                      ; tune 1 = Zone/wave music
@@ -3524,45 +3470,56 @@ atx_read:
 atx_done:
     rts
 
-; alien_move_tick: called once per frame per active alien. The real
-; BBC's own move_the_aliens processes CONST.asm's `process` (6) aliens
-; per real frame, round-robin across up to maxaliens=40 - so any given
-; alien ticks roughly once every 40/6 (~6.7) real frames when the pool
-; is near-full, which is where the old ALIEN_MOVE_SLOWDOWN=6 throttle
-; here came from. But our own pool is only ALIEN_COUNT=8 - with that
-; few aliens, the real round-robin cursor wraps back around (and
-; re-ticks the same aliens) almost every single frame, not every 6th,
-; so 6x was a mismatch. Running everything (this + the two bullet
-; throttles) at a real, untouched 1x turned out too fast once combined,
-; though - so this keeps the same reserved 2x speed budget as
-; BULLET_MOVE_SLOWDOWN, not a return to the old 6x mismatch.
-ALIEN_MOVE_SLOWDOWN = 2
-alien_move_count:
+; alien_move_tick: ALIENS3.asm's move_the_aliens. Once per game loop pass it deals with ALIEN_PROCESS (the
+; original's `process` = 6) slots, round-robin through the pool (alien_procst, wrapping at alien_pool_max =
+; the original's `aliens`): a live alien takes one step, an exploding one a frame of its explosion (every
+; other cycle, the original's expldelay), a free slot nothing. Each time the cycle wraps, the spawn
+; countdowns tick once (process_aliens). So an alien steps 6/pool_size times per pass, and the spawn rate
+; follows it - measured on the original, run headless: 0.5-0.6 steps per alien per pass in the early waves,
+; 33-42 steps a second at the BBC's pass rate, which this reaches by running one pass per frame.
+ALIEN_PROCESS = 6
+alien_procst:
+ .byte 0
+alien_expldelay:
+ .byte 0
+amt_left:
  .byte 0
 
 alien_move_tick:
-    inc alien_move_count
-    lda alien_move_count
-    cmp #ALIEN_MOVE_SLOWDOWN
-    bcc ma_rts
-    lda #0
-    sta alien_move_count
-
-    ldx #0
-ma_loop:
+    lda alien_pool_max
+    beq amt_rts
+    lda #ALIEN_PROCESS
+    sta amt_left
+amt_loop:
+    ldx alien_procst
     lda alien_active,x
-    beq ma_next
+    beq amt_next
     lda alien_exploding,x
-    bne ma_explode
+    bne amt_explode
     jsr alien_tick_one
-    jmp ma_next
-ma_explode:
+    jmp amt_next
+amt_explode:
+    lda alien_expldelay
+    and #1
+    bne amt_next
+    ldx alien_procst
     jsr alien_explode_tick
-ma_next:
-    inx
-    cpx alien_pool_max         ; real ALIENS3.asm move_the_aliens's
-    bne ma_loop                  ; "CPXaliens" bound
-ma_rts:
+amt_next:
+    inc alien_procst
+    lda alien_procst
+    cmp alien_pool_max
+    bcc amt_more
+    lda #0
+    sta alien_procst
+    inc alien_expldelay
+    lda game_state
+    cmp #GS_PLAYING
+    bne amt_more
+    jsr process_alien_spawns
+amt_more:
+    dec amt_left
+    bne amt_loop
+amt_rts:
     rts
 
 ; --- The player ship: decoded directly from the BBC object file, not
@@ -3691,12 +3648,21 @@ csa_row40_done:
     sta temp4+1              ; temp4 = screen-matrix address
     rts
 
-; draw_ship: draws the ship at column ship_col. The 6 cells' worth of
-; bitmap bytes are contiguous per row (temp3+0..23 covers all 3 top-row
-; cells, since adjacent C64 cells in a row sit back to back in memory),
-; so this is just two 24-byte linear copies rather than 6 separate
-; per-cell loops.
+; draw_ship / erase_ship: the ship is hardware sprite 7 (SPRMUX.asm). draw_ship (re)positions it from
+; ship_col/ship_row; erase_ship does nothing because a move is just draw_ship at the new cell, and ship_hide
+; takes it off the screen. The old bitmap versions live on as draw_ship_cells/erase_ship_cells: the ship's
+; explosion is still drawn in the bitmap, and erase_ship_cells clears it afterwards.
 draw_ship:
+    jmp spr_ship_show
+
+erase_ship:
+    rts
+
+ship_hide:
+    jmp spr_ship_hide
+
+; the bitmap version, no longer called: the ship is a sprite (see above)
+draw_ship_cells:
     lda ship_col
     jsr compute_ship_addrs
 
@@ -3778,7 +3744,7 @@ dsh_bottom:
 ; erase_alien_x above (exclude_kind=0 - the ship itself - so
 ; is_cell_covered checks aliens only, never the ship against itself;
 ; exclude_idx is unused/irrelevant when exclude_kind=0).
-erase_ship:
+erase_ship_cells:
     lda ship_col
     jsr compute_ship_addrs
 
@@ -4045,7 +4011,7 @@ ship_explode_count:
  .byte 0
 
 ship_crash:
-    jsr erase_ship
+    jsr ship_hide
     dec lives_count
 
     ldx #0
@@ -4148,7 +4114,7 @@ ship_explode_tick:
     inc ship_explode_timer
     rts
 she_finish:
-    jsr erase_ship
+    jsr erase_ship_cells
     lda lives_count
     beq she_over
     lda #SHIP_START_COL
@@ -5604,9 +5570,9 @@ score_glyphs:
                              ; (glyph code = digit value directly; blank/
                              ; space is a separate code, 38, unused here)
 
-SCORE_VALUE_COL = 8
-HI_COL          = 17
-HISCORE_COL     = 22
+SCORE_VALUE_COL = 12
+HI_COL          = 21
+HISCORE_COL     = 29
 
 ; --- Real high-score table (src/HIGH.asm) ---
 ; hs_score_digits: 8 rows x 4 bytes, same tens/hundreds/thousands/ten-
@@ -5621,10 +5587,19 @@ HISCORE_COL     = 22
 ; fill is space (38), NOT .res's default zero - glyph code 0 is the
 ; digit "0" (see score_glyphs' own comment above), so a zero-filled
 ; name would show as "0000000000", not blank.
-hs_score_digits:
- .res 8*4
-hs_names:
- .res 8*10, 38
+hs_score_digits:                 ; DOWN.asm highval: 30000 25000 20000 15000 10000 5000 3000 1000
+ .byte 0,0,0,3
+ .byte 0,0,5,2
+ .byte 0,0,0,2
+ .byte 0,0,5,1
+ .byte 0,0,0,1
+ .byte 0,0,5,0
+ .byte 0,0,3,0
+ .byte 0,0,1,0
+hs_names:                        ; DOWN.asm highname: "SUPERIOR  " on every row
+ .repeat 8
+ .byte 28,30,25,14,27,18,24,27,38,38
+ .endrepeat
 ; by ten" units) to add. Ripples a carry through score_digits like a
 ; plain 4-digit decimal counter (capping rather than wrapping if it ever
 ; overflows - out of display room, not a real game-breaking case), then
@@ -5813,7 +5788,7 @@ HS_TITLE_ROW = 3
 HS_TITLE_COL = 12
 HS_ROW0      = 6
 HS_ROW_STRIDE = 2
-HS_COL       = 4
+HS_COL       = 8
 
 ; hs_row_bitmap_lo/hi, hs_row_matrix_lo/hi: precomputed per-row
 ; destination addresses (8 entries, row X's screen row = HS_ROW0 +
@@ -6111,7 +6086,9 @@ hti_insert:
     sty hti_insert_row
     ldx #6
 hti_shift_loop:
-    cpx hti_insert_row
+    cpx #$FF                     ; X wraps 0 -> $FF when the new score goes in at row 0 - the unsigned
+    beq hti_shift_done           ; compare below never sees that as "below the insert row", so without this
+    cpx hti_insert_row           ; the loop ran forever (and trashed memory): a hang on the first high score
     bcc hti_shift_done
 
     txa                          ; 4-byte score row: src=X*4, dst=src+4
@@ -6200,7 +6177,7 @@ hsk_col_mask:
 ; - the scheme from the font-code fix), or a sentinel: $FD=DEL/INST
 ; (backspace), $FE=RETURN (finish), $FF=anything else (ignored). Matrix
 ; layout cross-checked against this file's own existing key checks:
-; col0/row1=RETURN (check_return_key), col7/row4=SPACE (check_space_key),
+; col0/row1=RETURN (check_return_key), col7/row4=SPACE (check_start_key),
 ; col5/row1=P (check_pause_key) all agree with the table below.
 key_glyph_table:
  .byte $FD,$FE,$FF,$FF,$FF,$FF,$FF,$FF   ; col0: DEL,RETURN,CRSR_R,F7,F1,F3,F5,CRSR_D

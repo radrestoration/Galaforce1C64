@@ -6,3 +6,4 @@ tools.cfg
 map.txt
 *.png
 *.tar
+__pycache__/

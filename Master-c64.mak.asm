@@ -41,12 +41,24 @@
 ; several KB, clearing the overlap with a comfortable margin.
 .include "src-c64/INIT.asm"
 .include "src-c64/STARS.asm"
+.include "src-c64/SPRMUX.asm"
+
+; labels the headless tests read (tools/test_game_sprites.py, through the label file `make` writes)
+.export title_wait_loop, show_high_scores, hs_loop, start_demo, hs_enter_name, game_loop_escape, refresh_music, start_tune
+.export score_digits, hs_score_digits
+.export spawn_player_bullet, init_alien_hp
+.export exec, game_loop, init_alien_wave, wave_off, spr_build, swarm_flag, alien_pool_max, alien_active, alien_x, alien_y
+.export alien_type, alien_exploding, alien_explode_timer, game_state, demo_flag, lives_count, c64_curwave
+.exportzp sz_back_ready, sz_front, sz_fcount
 
 .segment "RODATA"
 spfont:
 .incbin "object/O.SPFONT_C64"
 spfont_end:
 
+; The star arrays are in the high part of VIC bank 1 (STARARR, galaforce1-c64.cfg), not here: everything
+; below $4000 is needed for code. They are file-backed, so they start out zero.
+.segment "STARARR"
 stardat:    ;; Doesn't fit in zeropage and moving before code causes overflow
 .res 3 * 31
 

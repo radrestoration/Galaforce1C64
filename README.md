@@ -28,6 +28,14 @@ Needs cc65 (`cl65`) and python3.
 
 ## Display
 
+**Aliens are hardware sprites** (`src-c64/SPRMUX.asm`): a Y-sorted raster-IRQ multiplexer over sprites 0-6, fed each
+frame from the game's alien pool. **The ship is sprite 7**, moved a cell at a time by `spr_ship_show`. Sprite shapes and the shared colours are generated into `src-c64/gen/` by
+`tools/make_sprtest.py` (`make sprdata`). The 32-alien swarm waves cannot be multiplexed and are still drawn in the
+bitmap (`swarm_flag`). Bullets, stars, the ship's explosion and the HUD are still bitmap. `make test-game` plays the demo headless and
+checks the sprites against the alien pool (`PACE=1` and `PROF=1`, with `SYMS=`, measure how many frames each game loop pass takes and where the time goes); `spritetest/` is the stand-alone multiplexer test (`make run-sprtest`).
+Memory: code and data end below $4000; sprite shapes, tables and the star arrays are in the free part of VIC bank 1.
+
+
 Everything is drawn into the VIC-II multicolour bitmap (VIC bank 1: screen matrix `$4000`, bitmap `$6000`),
 160 x 200 colour pixels, which matches the BBC's MODE 2 pixel grid horizontally. The BBC screen is 256 lines
 high, so the vertical layout has to be squeezed to 200.
