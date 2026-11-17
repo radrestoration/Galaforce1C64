@@ -118,6 +118,7 @@ for L in range(int(cpu.cycles // CPL)):
             displays.append((mi, s, L % LINES, x, ptr, col))
 
 # ---- what the BBC recorded, through an independent copy of the transform -------------------------------
+YMAP = [int(v) for v in open(os.path.join(ROOT, "src-c64", "gen", "tables.inc")).read().split("spr_ymap:")[1].split("spr_gra2shape:")[0].replace(".byte", ",").replace("\n", "").split(",") if v.strip()]
 g2s = lambda g: 12 + g // 2 if g < 12 else (g - 12) // 2
 rep = open(os.path.join(B, "replay.bin"), "rb").read()
 frames, i = [], 0
@@ -126,7 +127,7 @@ while rep[i] != 0xFF:
     objs = []
     for k in range(n):
         x, y, g = rep[i + 1 + 3 * k: i + 4 + 3 * k]
-        ys = 50 + round(y * 200 / 256)
+        ys = 50 + YMAP[y]
         if ys <= 235:
             objs.append((x * 4 + 24, ys, 0x10 + g2s(g)))
     frames.append(objs)

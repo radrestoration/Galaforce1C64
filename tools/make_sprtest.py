@@ -1,5 +1,5 @@
 """Data for the sprite multiplexer test (spritetest/sprtest.s), made from the real decoded graphics in
-src-c64/INIT.asm and the alien positions recorded from the original BBC game (tools/bbc_trace.sh).
+src-c64/INIT.asm (explosion frames), sprites/shape_source.asm (aliens, ship) and the alien positions recorded from the original BBC game (tools/bbc_trace.sh).
 
 usage: make_sprtest.py <outdir>
 
@@ -14,6 +14,7 @@ A multicolour sprite has two colours shared by all sprites (pixel values 01 and 
 lose as few pixels as possible against the one global pair (chosen over all pairs, weighted by how often
 each shape appears in the recorded waves).
 """
+import collections
 import itertools
 import json
 import os
@@ -24,7 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, "..")
 out = sys.argv[1]
 os.makedirs(out, exist_ok=True)
-src = open(os.path.join(ROOT, "src-c64", "INIT.asm")).read().split("\n")
+src = (open(os.path.join(ROOT, "src-c64", "INIT.asm")).read() + "\n" + open(os.path.join(ROOT, "sprites", "shape_source.asm")).read()).split("\n")
 
 NAMES = ["0", "1b", "2", "1", "4", "5", "6", "7", "8", "9", "9", "9"]     # alien_bitmap_lo/hi order
 consts = {m.group(1): int(m.group(2), 16) for l in src if (m := re.match(r"(\w+)\s*=\s*\$([0-9a-fA-F]+)", l))}
@@ -155,7 +156,12 @@ for name in ("ship", "alien0"):
         rep.append("  " + "".join(".1230"[p] if p else "." for p in row))
 
 # ---- tables ---------------------------------------------------------------------------------------------
-ymap = [round(y * 200 / 256) for y in range(256)]
+# BBC scanline -> C64 screen line. The original does not draw aliens above scanline 23 (below the score line), so
+# 23 goes to the first line under the C64 score bar (8) and 234, the ship's lowest position, to the ship's lowest
+# row (line 184); in between it is linear (0.834 lines per scanline, against 0.78 for a plain 256 -> 200 scale).
+YMAP_TOP, YMAP_BOT = (23, 8), (234, 184)
+YSCALE = (YMAP_BOT[1] - YMAP_TOP[1]) / (YMAP_BOT[0] - YMAP_TOP[0])
+ymap = [min(255, round(YMAP_TOP[1] + (y - YMAP_TOP[0]) * YSCALE)) if y >= YMAP_TOP[0] else (y * (YMAP_TOP[1] - 1)) // YMAP_TOP[0] for y in range(256)]
 g2s = [shape_of_gra(g) if g in range(0, 12, 2) or g in range(12, 36, 2) else 0 for g in range(0, 36, 2)]
 
 
@@ -172,12 +178,62 @@ with open(os.path.join(out, "tables.inc"), "w") as f:
     f.write(bytes_lines("spr_gra2shape", g2s))
     f.write(bytes_lines("spr_own_col", own))
 
+# ---- per-wave palettes ------------------------------------------------------------------------------------
+# The two shared colours need not be the same all game: each wave gets the pair that costs its own aliens (as
+# recorded in the BBC traces) and the ship the fewest wrong-coloured pixels. canon.bin holds every shape with
+# its pixels as the original bitmap values (1-3); at the start of a wave the game remaps them into the sprite
+# blocks with that wave's roles (spr_palette in SPRMUX.asm).
+SHIP = 18
+wave_pal = []                        # per wave (A, B)
+wave_roles = []                      # per wave, per shape: (packed roles, own colour)
+for w in range(16):
+    f = collections.Counter()
+    frames = 0
+    for sample in waves.get(w, []):
+        frames += 1
+        for a in sample:
+            f[shape_of_gra(a[3])] += 1
+    f[SHIP] = max(frames, 1) * 3                                 # always on screen, and the player's own
+    for e in range(12, 18):
+        f[e] = max(frames // 50, 1)                              # explosions: every wave has some
+    best = min((sum(v * cost(k, A, B)[0] for k, v in f.items()), (A, B) != (SA, SB), A, B) for A in range(16) for B in range(16))
+    _, _, A, B = best
+    wave_pal.append((A, B))
+    row = []
+    for sh in range(len(shapes)):
+        lost, perm = cost(sh, A, B)
+        ia, io, ib = perm
+        role = {ia + 1: 1, io + 1: 2, ib + 1: 3}
+        row.append((role[1] | role[2] << 2 | role[3] << 4, shapes[sh][2][io]))
+    wave_roles.append(row)
+    ev = sum(f[k] * cost(k, A, B)[0] for k in range(12))
+    ev0 = sum(f[k] * cost(k, SA, SB)[0] for k in range(12))
+    n = max(sum(f[k] for k in range(12)), 1)
+    rep.append(f"wave {w:2d}: shared {NAMEC[A]}+{NAMEC[B]}; aliens lose {ev / n:5.1f} px each (global pair: {ev0 / n:5.1f}); ship loses {cost(SHIP, A, B)[0]}")
+canon = bytearray()
+for name, d, cc in shapes:
+    blk = bytearray()
+    for y in range(21):
+        px = pixels(d)[y] if y < 16 else [0] * 12
+        for k in range(0, 12, 4):
+            blk.append(px[k] << 6 | px[k + 1] << 4 | px[k + 2] << 2 | px[k + 3])
+    blk.append(0)
+    canon += blk
+open(os.path.join(out, "canon.bin"), "wb").write(canon)
+with open(os.path.join(out, "pal.inc"), "w") as f:
+    f.write("spr_wave_pal:\n" + "".join(f" .byte {A},{B}\n" for A, B in wave_pal))
+    f.write("spr_role_lo:\n .byte " + ",".join(f"<(spr_roles+{w * 2 * len(shapes)})" for w in range(16)) + "\n")
+    f.write("spr_role_hi:\n .byte " + ",".join(f">(spr_roles+{w * 2 * len(shapes)})" for w in range(16)) + "\n")
+    f.write("spr_roles:\n")
+    for w in range(16):
+        f.write(" .byte " + ",".join(f"{r},{c}" for r, c in wave_roles[w]) + f"   ; wave {w}\n")
+
 # ---- the replay: normal waves only, the densest stretches ---------------------------------------------
 H = 24
 
 
 def demand(sample):
-    ys = sorted(round(a[2] * 200 / 256) for a in sample)
+    ys = sorted(ymap[a[2]] for a in sample)
     best = 0
     for i, y in enumerate(ys):
         best = max(best, sum(1 for z in ys[i:] if z < y + H))

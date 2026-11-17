@@ -12,47 +12,24 @@
 ;; explosions, and music (see the file header further down, above
 ;; start_tune, for the music system specifically).
 ;;
-;; Everything on screen (text, stars, ship, alien, flags, lives icon,
-;; bullets) is plotted as real bitmap pixels in VIC-II MULTICOLOR bitmap
-;; mode: bank 1, screen-matrix at $4000 (per-cell colors - hi-nibble and
-;; lo-nibble select 2 of the cell's 3 non-background colors, color RAM's
-;; low-nibble the 3rd; see clear_screen), bitmap data at $6000 (320x200,
-;; 8 bytes/cell, 40x25 cells, 2 bits/pixel = 160 color-pixels wide).
-;; Chosen over standard (hi-res) bitmap mode because C64 multicolor's
-;; color-pixel grid (160 wide) is dimensionally identical to BBC MODE 2's
-;; own pixel grid (also 160 wide, also "fat"/double-width pixels) - real
-;; BBC font/graphics data maps at NATIVE width with no stretching, and
-;; each cell gets 3 independently-settable colors (not just 1), much
-;; closer to BBC MODE 2's real per-pixel color density than hi-res
-;; bitmap's "background + 1 foreground per cell" would allow. The cost -
-;; shared with every C64 multicolor mode - is half the hi-res horizontal
-;; resolution, screen-wide.
+;; The aliens and the ship are hardware sprites (SPRMUX.asm: a raster-interrupt multiplexer; the ship's burst, below, is
+;; the exception). Everything else - text, stars, bullets, flags, lives icons, the ship's burst - is plotted as real
+;; bitmap pixels in VIC-II MULTICOLOR bitmap mode: bank 1, screen-matrix at $4000 (per-cell colours - hi-nibble and
+;; lo-nibble select 2 of the cell's 3 non-background colours, colour RAM's low nibble the 3rd; see clear_screen),
+;; bitmap data at $6000 (320x200, 8 bytes/cell, 40x25 cells, 2 bits/pixel = 160 colour-pixels wide).
+;; Chosen over standard (hi-res) bitmap mode because C64 multicolour's colour-pixel grid (160 wide) is dimensionally
+;; identical to BBC MODE 2's own pixel grid (also 160 wide), so the real BBC font/graphics data maps at NATIVE width,
+;; and each cell gets 3 independently-settable colours.
 ;;
-;; Only 3 non-background colors exist at once, and they're set the SAME
-;; for every plain background cell (clear_screen). Anything needing more
-;; colors than that (the ship, alien, lives icon) gets its OWN per-cell
-;; screen-matrix/color-RAM override instead of using the shared
-;; background palette - see draw_ship/draw_alien/draw_one_lifeicon - and
-;; must therefore fully own whichever cells it's drawn into (a moving
-;; object's erase step overwrites those cells outright, not XOR, so nothing
-;; using the shared background palette - a star, a bullet - can safely
-;; share a cell with one of these without the object's next move
-;; clobbering it; see fire_bullet_if_requested's comment on the bug this
-;; caused once already). Anything that reuses the shared background
-;; palette (stars, bullets) draws via XOR instead, needing no per-cell
-;; color writes at all, and CAN move through arbitrary cells freely.
+;; Only 3 non-background colours exist at once, and they're set the SAME for every plain background cell
+;; (clear_screen). Anything needing more colours (the flags, the lives icon, the ship's burst) gets its OWN per-cell
+;; screen-matrix/colour-RAM override instead, and so must fully own whichever cells it's drawn into. Anything that
+;; reuses the shared background palette (stars, bullets) draws via XOR instead, needing no per-cell colour writes at
+;; all, and CAN move through arbitrary cells freely.
 ;;
-;; Moving objects (ship, bullets; aliens once they move) are erased (re-
-;; plot the background) at their old position and redrawn at the new one
-;; every frame they move - real CPU cost hardware sprites don't charge.
-;; Budget for this per-object as more of them appear at once; measured
-;; BBC vs. C64 effective speeds are much closer than the raw 2MHz-vs-1MHz
-;; clocks suggest once RAM access and badline overhead are accounted for
-;; (BBC's 6502A only hits 2MHz for ROM; RAM access is ~1MHz regardless of
-;; video mode - see https://www.everygamegoing.com/larticle/speed-the-big-difference-000/52365
-;; and https://stardot.org.uk/forums/viewtopic.php?t=11997), but it's
-;; still the resource to watch as more systems interact (alien animation,
-;; collision detection, more bullets).
+;; The game loop runs once a frame, locked to the raster (it waits for line 250), and everything that moves does so
+;; once a pass. The CPU budget is the thing to watch: see tools/test_game_sprites.py (PACE=1, PROF=1) for how long
+;; a pass takes.
 ;;
 ;; Keyboard input is read directly through the CIA1 keyboard matrix
 ;; ($DC00 selects a column by clearing its bit; $DC01 then reads that
@@ -121,6 +98,7 @@ exec:
 ; just-finished game ended on instead of the attract-mode defaults.
 title_wait_loop:
     jsr spr_reset
+    jsr music_stop               ; the title and high-score screens have no music
     lda #3
     sta lives_count
     lda #1
@@ -143,7 +121,6 @@ twl_wait_raster:
     cmp $D012
     bne twl_wait_raster
     jsr movestars
-    jsr refresh_music
     jsr check_start_key
     beq manual_game_start
     inc title_frame_count
@@ -168,7 +145,6 @@ hs_wait_raster:
     cmp $D012
     bne hs_wait_raster
     jsr movestars
-    jsr refresh_music
     jsr check_start_key
     beq manual_game_start
     inc title_frame_count
@@ -184,6 +160,8 @@ hs_wait_raster:
 start_demo:
     lda #1
     sta demo_flag
+    lda #0
+    sta dem_section
     lda #255                ; matches INIT.asm's own "LDX#&FF:STXdemo_count"
     sta demo_count           ; - forces process_demo to pick a fresh random
     jmp game_start            ; direction/count on its first call, not carry
@@ -210,6 +188,7 @@ game_start:
     lda #1
     sta level_ones
     lda #0
+    sta xlife_given
     sta c64_curwave
     sta game_state
     sta score_digits
@@ -228,15 +207,18 @@ game_start:
     jsr init_alien_wave
     lda #SHIP_START_COL
     sta ship_col
-    lda #SHIP_START_ROW
+    jsr ship_home_row
     sta ship_row
     jsr draw_ship
 
     lda #0
     sta fire_delay
 
-    lda #0                  ; tune 0 = Game Start (see start_tune)
-    jsr start_tune
+    lda demo_flag            ; the demo has no start tune, as in the original
+    bne gs_no_tune
+    lda #MUS_START
+    jsr music_start
+gs_no_tune:
 
 game_loop:
     lda #250
@@ -246,10 +228,31 @@ gl_wait_raster:
 
     jsr spr_build              ; next frame's sprite list, from the alien pool as the last frame left it
 
+    lda demo_flag            ; any start key ends the demo and starts a real game
+    beq gl_not_demo
+    jsr check_start_key
+    bne gl_not_demo
+    jsr music_stop
+    jmp manual_game_start
+gl_not_demo:
     jsr check_escape_key
     bne gl_no_escape
+    lda demo_flag
+    beq gl_give_up
     jmp game_loop_escape     ; out of branch range - see pas_next's
                               ; matching comment on why
+gl_give_up:
+    lda game_state
+    cmp #GS_PLAYING
+    bne gl_no_escape
+gl_icons:                    ; ROUT4.asm's escape: no ships left (their icons go), then the ship crashes
+    lda lives_count
+    beq gl_icons_done
+    dec lives_count
+    jsr redraw_lives_after_loss
+    jmp gl_icons
+gl_icons_done:
+    jsr ship_crash
 gl_no_escape:
 
     ; P toggles a full freeze (stars/music/gameplay all skipped below) -
@@ -275,19 +278,25 @@ gl_pause_checked:
     jmp game_loop
 gl_not_paused:
 
+    jsr check_ks_keys
+.ifdef CHEAT
+    jsr check_cheats
+.endif
     jsr movestars
-    jsr refresh_music
+    jsr demo_music
 
     lda game_state
     cmp #GS_SHIP_EXPLODING
-    beq gl_exploding
+    bcs gl_exploding            ; exploding, or the game is over
 
     jsr process_demo
+    jsr check_xlife
     jsr handle_ship_input
     jsr fire_bullet_if_requested
     jsr demo_process_fire
     jsr move_bullets
     jsr move_alien_bullets
+    jsr random_alien_bomb
 
     ; A collision below may call ship_crash, which sets game_state to
     ; GS_SHIP_EXPLODING mid-frame - skip try_load_next_group in that
@@ -306,10 +315,19 @@ game_loop_no_wave_check:
     jsr check_alien_ship_collision
     jmp game_loop
 gl_exploding:
+    lda game_state
+    cmp #GS_GAME_OVER
+    beq gl_over                  ; already over: just wait for the tune
     jsr ship_explode_tick_throttled
     lda game_state
     cmp #GS_GAME_OVER
+    bne gl_again
+gl_over:
+    lda demo_flag                ; the demo's own game over goes straight back to the title cycle
+    bne game_loop_escape
+    jsr music_busy               ; the game-over tune plays out first, as in the original
     beq game_loop_escape
+gl_again:
     jmp game_loop
 ; game_loop_escape: reached either via a real game over (ship out of
 ; lives, game_state already GS_GAME_OVER) or the RUN/STOP debug escape
@@ -319,6 +337,8 @@ gl_exploding:
 ; HIGH.asm's ahigh has no "quit early" concept to match against, and it
 ; would be misleading to score-check an arbitrary mid-game escape.
 game_loop_escape:
+    jsr music_stop               ; (the demo's tune may still be playing)
+    jsr spr_reset                ; no aliens or ship on the title and high-score screens
     lda game_state
     cmp #GS_GAME_OVER
     bne gle_to_title
@@ -350,11 +370,32 @@ gle_to_title:
 title_frame_count:
  .byte 0
 
-; check_escape_key: RUN/STOP, checked each frame in game_loop to bail
-; back to the title - a TEMPORARY stand-in (you flagged the real key as
-; probably different, TBD) for whatever quits play on the real hardware.
-; Returns with the Z flag set (BEQ taken by the caller) if held, same
-; convention as check_start_key.
+; demo_music: ROUT4/INIT.asm's dem_sound - while the demo plays, each time its tune has ended the next section's tune
+; starts. dem_section counts 7 down to 0 and wraps; dem_tunes is the original's dem_table (offsets 21, 21, 42, 42, 49,
+; 49, 56, 56 = tunes 3, 3, 6, 6, 7, 7, 8, 8, indexed by the section, so played in the reverse of that order).
+dem_section:
+ .byte 0
+dem_tunes:
+ .byte MUS_DEMO_D,MUS_DEMO_D,MUS_DEMO_C,MUS_DEMO_C,MUS_DEMO_B,MUS_DEMO_B,MUS_DEMO_A,MUS_DEMO_A
+demo_music:
+    lda demo_flag
+    beq dm_rts
+    jsr music_busy
+    bne dm_rts
+    dec dem_section
+    bpl dm_ok
+    lda #7
+    sta dem_section
+dm_ok:
+    ldx dem_section
+    lda dem_tunes,x
+    jmp music_start
+dm_rts:
+    rts
+
+; check_escape_key: RUN/STOP, the original's ESCAPE: in a game it gives up (loses every ship, as ROUT4.asm's
+; escape does); in the demo it goes back to the title. Returns with the Z flag set if held, same convention as
+; check_start_key.
 check_escape_key:
     lda #$7F               ; clear bit7: select column 7 (same column as SPACE)
     sta $DC00
@@ -366,6 +407,9 @@ check_escape_key:
 ; if SPACE or RETURN is currently held, clear otherwise. See the C64
 ; keyboard matrix note by handle_ship_input for how CIA1 is used here.
 check_start_key:
+    jsr read_joystick        ; the fire button of a joystick in port 2 starts too
+    and #$10
+    beq csk_pressed
     lda #$7F              ; clear bit7: select column 7 (SPACE's column)
     sta $DC00
     lda $DC01
@@ -382,14 +426,6 @@ csk_pressed:
     lda #0
     rts
 
-; check_return_key: Z set if RETURN is held (the fire key).
-check_return_key:
-    lda #$FE              ; clear bit0: select column 0 (RETURN's column)
-    sta $DC00
-    lda $DC01
-    and #$02                ; row bit 1 = RETURN
-    rts
-
 check_pause_key:
     lda #$DF              ; clear bit5: select column 5 (P's column)
     sta $DC00
@@ -397,21 +433,13 @@ check_pause_key:
     and #$02                ; row bit 1 = P
     rts
 
-; handle_ship_input: polls Z/X (left/right) and ":"/"/" (up/down - see
-; below) via the CIA1 keyboard matrix ($DC00 selects a column by
-; clearing its bit; $DC01 then reads that column's row switches, 0 =
-; pressed) and moves the ship one cell per call, throttled to every
-; SHIP_MOVE_SLOWDOWN'th call so it doesn't outrun the eye at 50/60 calls
-; a second. Erase-then-redraw, same "just overwrite the cells" approach
-; as the rest of this file - the ship isn't blended with whatever star
-; happened to be under it.
+; handle_ship_input: polls Z/X (left/right), ";" or "=" (up) and "/" (down) via the CIA1 keyboard matrix ($DC00
+; selects a column by clearing its bit; $DC01 then reads that column's row switches, 0 = pressed), or the joystick
+; in port 2 when the K key has switched to it, and moves the ship one cell per call, throttled to every
+; SHIP_MOVE_SLOWDOWN'th call. The ship is a sprite, so a move is just a new position (draw_ship).
 ;
-; The C64 keyboard has no dedicated unshifted apostrophe key the way a
-; PC one does, so "up" is mapped to the physical key that sits in the
-; same spot on a real C64 keyboard: ":" (column 5, row bit 5). "/" is a
-; real, unshifted C64 key as-is (column 6, row bit 7) and needs no
-; substitution. If VICE's keymap sends host "'" somewhere else, this is
-; a 2-constant fix (the LDA #$DF / AND #$20 pair below).
+; "Up" is ";" (the physically right key on a C64 keyboard) or "=" (where VICE's default keymap lands a host
+; apostrophe) - see hsi_check_up.
 SHIP_MOVE_SLOWDOWN = 4
 
 handle_ship_input:
@@ -430,7 +458,13 @@ hsi_slowdown_ok:
     ; and is left/right only, same as the source (the up/down half of its
     ; movement decision, temp3+1, is never touched in the demo branch).
     lda demo_flag
-    bne hsi_demo_move
+    beq hsi_not_demo
+    jmp hsi_demo_move
+hsi_not_demo:
+    lda joy_flag
+    beq hsi_keys
+    jmp hsi_joystick
+hsi_keys:
 
     lda #$FD               ; clear bit1: select column 1 (Z's column)
     sta $DC00
@@ -526,6 +560,210 @@ hsi_demo_flip:
 
 hsi_done:
     rts
+
+; hsi_joystick: the ship follows a joystick in port 2 (bit 0 up, 1 down, 2 left, 3 right; 0 = pressed), the same moves
+; as the keys.
+hsi_joystick:
+    jsr read_joystick
+    sta joy_bits
+    and #$04
+    bne hj_right
+    lda ship_col
+    cmp #SHIP_MIN_COL
+    beq hj_right
+    dec ship_col
+hj_right:
+    lda joy_bits
+    and #$08
+    bne hj_up
+    lda ship_col
+    cmp #SHIP_MAX_COL
+    beq hj_up
+    inc ship_col
+hj_up:
+    lda joy_bits
+    and #$01
+    bne hj_down
+    lda ship_row
+    cmp #SHIP_MIN_ROW
+    beq hj_down
+    dec ship_row
+hj_down:
+    lda joy_bits
+    and #$02
+    bne hj_done
+    lda ship_row
+    cmp #SHIP_MAX_ROW
+    beq hj_done
+    inc ship_row
+hj_done:
+    jsr draw_ship
+    jmp hsi_done
+
+; read_joystick: A = the port 2 joystick, bit 0 up, 1 down, 2 left, 3 right, 4 fire, 0 = pressed. (Setting the keyboard
+; column lines high first stops the keyboard matrix reaching the port.)
+read_joystick:
+    lda #$FF
+    sta $DC00
+    lda $DC00
+    rts
+
+joy_flag:                       ; 1 = joystick (the K key), 0 = keyboard
+ .byte 0
+joy_bits:
+ .byte 0
+ks_prev_k:
+ .byte 0
+ks_prev_s:
+ .byte 0
+
+; ---- test build only (make test-build): cheat keys ----------------------------------------------------------------------
+;   1  skip to the next wave      2  an extra ship      3  invulnerable on/off (the border turns red)
+;   4  +10000 points (20000 gives the extra life, as in a real game)
+.ifdef CHEAT
+cheat_god:
+ .byte 0
+cheat_prev:
+ .res 4
+
+; cheat_key: A = column select, X = row mask, Y = index in cheat_prev; returns Z clear for one pass per press.
+cheat_key:
+    sta $DC00
+    txa
+    and $DC01
+    bne ck_up
+    lda cheat_prev,y
+    bne ck_no
+    lda #1
+    sta cheat_prev,y
+    rts                      ; Z clear: a new press
+ck_up:
+    lda #0
+    sta cheat_prev,y
+ck_no:
+    lda #0                   ; Z set
+    rts
+
+check_cheats:
+    lda demo_flag
+    bne cc_rts
+    lda game_state
+    cmp #GS_PLAYING
+    bne cc_rts
+    lda #$7F                 ; 1: column 7, row bit 0
+    ldx #$01
+    ldy #0
+    jsr cheat_key
+    beq cc_2
+    jsr advance_to_next_wave
+cc_2:
+    lda #$7F                 ; 2: column 7, row bit 3
+    ldx #$08
+    ldy #1
+    jsr cheat_key
+    beq cc_3
+    lda lives_count
+    cmp #6
+    bcs cc_3
+    inc lives_count
+    jsr draw_lives_icons
+cc_3:
+    lda #$FD                 ; 3: column 1, row bit 0
+    ldx #$01
+    ldy #2
+    jsr cheat_key
+    beq cc_4
+    lda cheat_god
+    eor #1
+    sta cheat_god
+    beq cc_god_off
+    lda #2
+    .byte $2C                ; (bit: skips the lda #0)
+cc_god_off:
+    lda #0
+    sta $D020
+cc_4:
+    lda #$FD                 ; 4: column 1, row bit 3
+    ldx #$08
+    ldy #3
+    jsr cheat_key
+    beq cc_rts
+    lda score_digits+3
+    cmp #9
+    bcs cc_rts
+    inc score_digits+3
+    lda score_digits+3
+    sta score_glyphs
+    jsr redraw_score
+cc_rts:
+    rts
+.endif
+
+; check_ks_keys: ROUT1.asm's sound_on_off/key_joy: K switches between keyboard and joystick, S the sound on and off.
+; The letter in the corner of the screen shows the state (K or J, S or Q). A key counts once per press.
+check_ks_keys:
+    lda #0
+    sta cks_changed
+    lda #$EF                 ; column 4: K is row bit 5
+    sta $DC00
+    lda $DC01
+    and #$20
+    bne cks_k_up
+    lda ks_prev_k
+    bne cks_s
+    lda #1
+    sta ks_prev_k
+    lda joy_flag
+    eor #1
+    sta joy_flag
+    inc cks_changed
+    jmp cks_s
+cks_k_up:
+    lda #0
+    sta ks_prev_k
+cks_s:
+    lda #$FD                 ; column 1: S is row bit 5
+    sta $DC00
+    lda $DC01
+    and #$20
+    bne cks_s_up
+    lda ks_prev_s
+    bne cks_done
+    lda #1
+    sta ks_prev_s
+    jsr sound_toggle
+    inc cks_changed
+    jmp cks_done
+cks_s_up:
+    lda #0
+    sta ks_prev_s
+cks_done:
+    lda cks_changed
+    beq cks_rts
+    lda #20                  ; K
+    ldx joy_flag
+    beq cks_k_glyph
+    lda #19                  ; J
+cks_k_glyph:
+    sta str_k
+    lda #28                  ; S
+    ldx sound_off
+    beq cks_s_glyph
+    lda #26                  ; Q
+cks_s_glyph:
+    sta str_s
+    ldx #31                  ; the old letters out (columns 35-38 of the bottom row), the new ones in, and the lives
+    lda #0                   ; icons over the edge of the last one
+cks_clear:
+    sta $6000+(24*40+35)*8,x
+    dex
+    bpl cks_clear
+    jsr draw_ks_indicator
+    jsr draw_lives_icons
+cks_rts:
+    rts
+cks_changed:
+ .byte 0
 
 ship_col:
  .byte 0
@@ -657,10 +895,17 @@ fire_bullet_if_requested:
     beq fbr_read
     dec fire_delay
 fbr_read:
+    lda joy_flag
+    beq fbr_key
+    jsr read_joystick
+    and #$10                 ; fire button (0 = pressed)
+    jmp fbr_test
+fbr_key:
     lda #$FE               ; clear bit0: select column 0 (RETURN's column)
     sta $DC00
     lda $DC01
     and #$02                 ; row bit 1 = RETURN
+fbr_test:
     beq fbr_held
     lda #0
     sta fire_delay           ; released: the next press fires at once
@@ -709,8 +954,8 @@ spb_row_set:
     jsr draw_bullet_x
     lda #FIRE_DELAY
     sta fire_delay
-    lda #0                  ; sound 0 - placeholder until real effect data exists
-    jsr mk_sound
+    lda #SFX_FIRE
+    jsr sfx_play
     rts
 
 ; move_bullets: advances every active bullet one cell-row up per call,
@@ -750,8 +995,7 @@ mbs_loop:
     ; Fix: just don't XOR-draw a bullet while it's on a protected row -
     ; one invisible frame passing through is a fair trade for never
     ; touching that memory at all. is_row_protected is STARS.asm's same
-    ; row-0/23/24 check already used for stars (and now aliens - see
-    ; draw_alien_x/erase_alien_x) - reused here rather than duplicated.
+    ; row-0/23/24 check already used for stars - reused here rather than duplicated.
     lda bullet_row,x
     sta temp1
     jsr is_row_protected
@@ -820,6 +1064,63 @@ alien_bullet_row:
  .res ALIEN_BULLET_COUNT
 alien_bullet_col:
  .res ALIEN_BULLET_COUNT
+alien_bullet_fast:
+ .res ALIEN_BULLET_COUNT
+
+; alien_bullet_home: X = bomb slot (preserved). BOMBS2.asm's malbomb4: from wave 13 on, in a wave of fewer than 20
+; aliens, bombs drift toward the ship - every bomb from wave 29, from wave 13 on only the slow ones. The original
+; moves one pixel on half of its moves; a column here is 4 pixels, so one column on one move in eight.
+alien_bullet_home:
+    lda alien_pool_max_m1
+    cmp #20
+    bcs abh_rts
+    lda c64_curwave
+    cmp #13
+    bcc abh_rts
+    cmp #29
+    bcs abh_go
+    lda alien_bullet_fast,x
+    bmi abh_rts
+abh_go:
+    stx afb_saved_x
+    jsr demo_rand
+    ldx afb_saved_x
+    and #7
+    bne abh_rts
+    lda ship_col
+    clc
+    adc #1
+    cmp alien_bullet_col,x
+    beq abh_rts
+    bcc abh_left
+    inc alien_bullet_col,x
+    rts
+abh_left:
+    dec alien_bullet_col,x
+abh_rts:
+    rts
+
+; random_alien_bomb: once a pass, BOMBS2.asm's process_aliens_bombs - one pass in 16 a random alien of the pool
+; drops a bomb (the patterns' own DAT_DROPBOMB are in addition).
+random_alien_bomb:
+    lda alien_bullet_live_count
+    cmp #ALIEN_BULLET_COUNT
+    bcs rab_rts
+    jsr demo_rand
+    and #15
+    bne rab_rts
+    jsr demo_rand
+    and #63
+    cmp alien_pool_max
+    bcs rab_rts
+    tax
+    lda alien_active,x
+    beq rab_rts
+    lda alien_exploding,x
+    bne rab_rts
+    jmp alien_fire_bomb
+rab_rts:
+    rts
 
 ; compute_alien_bullet_addr: X = alien-bullet slot index. Same row*40+
 ; col*8 math as compute_bullet_addr, kept as its own copy rather than
@@ -885,22 +1186,24 @@ dabx_loop:
 ; active alien bullet one cell-row per call, deactivating past row 24
 ; (the last row) instead of wrapping. Same reserved 2x throttle as
 ; BULLET_MOVE_SLOWDOWN, same reasoning - see its comment.
-ALIEN_BULLET_MOVE_SLOWDOWN = 2
 alien_bullet_move_count:
  .byte 0
 
+; BOMBS2.asm: a "fast" bomb moves every pass, the others every other pass (alien_bullet_fast, bit 7, chosen when it
+; is dropped); the later waves' bombs also drift toward the ship (alien_bullet_home).
 move_alien_bullets:
     inc alien_bullet_move_count
-    lda alien_bullet_move_count
-    cmp #ALIEN_BULLET_MOVE_SLOWDOWN
-    bcc mabs_rts
-    lda #0
-    sta alien_bullet_move_count
 
     ldx #0
 mabs_loop:
     lda alien_bullet_active,x
     beq mabs_next
+    lda alien_bullet_fast,x
+    bmi mabs_move
+    lda alien_bullet_move_count
+    and #1
+    bne mabs_next
+mabs_move:
 
     ; Same reasoning as move_bullets above - an alien bullet reaching
     ; row 23/24 on its way to deactivating at the bottom would XOR
@@ -917,6 +1220,7 @@ mabs_erase_skip:
     cmp #24
     beq mabs_deactivate
     inc alien_bullet_row,x
+    jsr alien_bullet_home
 
     lda alien_bullet_row,x
     sta temp1
@@ -933,386 +1237,16 @@ mabs_next:
     inx
     cpx #ALIEN_BULLET_COUNT
     bne mabs_loop
-mabs_rts:
     rts
 
-; --- Aliens: decoded from O.GRAPHIC's graphics pointer table, same table
-; the ship's graph+36/37 pointer lives in (entries 96 bytes apart =
-; alwidth*alheight=6*16, CONST.asm) and the same dual-buffer "sprite"
-; plotter, so the same row-reversal applies. Which entries to decode
-; isn't a guess: ALIENS1.asm's spawn-group records (see alien_spawn_table
-; below) each carry a raw `initgra` byte, and ALIENS2.asm reads it as
-; "LDY algra,X : LDX graph,Y : LDA graph+1,Y" - Y indexes BYTES into a
-; table of 2-byte pointers, so the real entry index is initgra/2, and
-; the real per-type index used everywhere in this port (alien_type,
-; alien_hp_table/alien_score_table, this table set) is (initgra-12)/2 -
-; traced from ALIENS2.asm's own "SEC:SBC#12:LSRA".
+; --- The "burst" explosion - the REAL BBC explosion sequence (ALIENS3.asm's `.explosion`), decoded from O.GRAPHIC's
+; graph-table entries 0-5 (row-reversed, 4-bit-nibble dual-buffer format) and pixel-verified against the alien
+; shapes before use. The aliens' bursts are now sprite shapes (the same six frames, made from these tables by
+; tools/make_sprtest.py); the ship's burst is still drawn here, into the bitmap, as a plain overwrite of each frame.
+; Each frame keeps its own 2-colour palette (all six are fire colours: yellow/red/white).
 ;
-; alien_bitmap_0/1/2 were the first three decoded (this port's original
-; 3-type era); a later full 12-type decode pass (verified pixel-exact
-; against these three before trusting the other 9) turned up that
-; alien_bitmap_1 is real type 3 (gra=18), not type 1 (gra=14) as first
-; assumed - type 1 was never actually decoded, it just happened to get
-; a plausible-looking label. Real type 1 data was decoded in a later
-; pass and lives at alien_bitmap_1b (see alien_bitmap_lo/hi near
-; draw_alien_x) - the _1b name, not _1, because _1 was already taken by
-; the mislabeled real type 3 by the time this was sorted out.
-; Also worth knowing: type 5 (gra=22) decodes to the exact same raw
-; pixels as the player ship, upside down relative to ship_bitmap (their
-; graph-table blocks are byte-identical once row-reversed) - confirmed,
-; not an artifact of decoding it differently.
-;
-; Colors reduced per-type (each type's own dominant colors, not a shared
-; palette), stray/minor pixels folded into whichever major color they
-; were spatially adjacent to (measured, not guessed) - except type 8,
-; where the fold was a near-tie (red 23 vs blue 21 neighbors) and is
-; flagged here as the one genuinely low-confidence color call.
-ALIEN_MATRIX_0   = $63  ; hi=6 blue (01), lo=3 cyan (10)
-ALIEN_COLORRAM_0 = $01  ; white (11)
-ALIEN_MATRIX_1   = $26  ; hi=2 red (01), lo=6 blue (10)
-ALIEN_COLORRAM_1 = $04  ; magenta (11)
-ALIEN_MATRIX_2   = $63  ; hi=6 blue (01), lo=3 cyan (10)
-ALIEN_COLORRAM_2 = $04  ; magenta (11)
-ALIEN_MATRIX_4   = $57  ; hi=5 green (01), lo=7 yellow (10)
-ALIEN_COLORRAM_4 = $03  ; cyan (11)
-ALIEN_MATRIX_5   = $17  ; hi=1 white (01), lo=7 yellow (10) - same as
-ALIEN_COLORRAM_5 = $03  ; cyan (11) - SHIP_MATRIX_BYTE/SHIP_COLORRAM_BYTE
-ALIEN_MATRIX_6   = $24  ; hi=2 red (01), lo=4 magenta (10)
-ALIEN_COLORRAM_6 = $07  ; yellow (11)
-ALIEN_MATRIX_7   = $36  ; hi=3 cyan (01), lo=6 blue (10)
-ALIEN_COLORRAM_7 = $06  ; blue (11) - unused (only 2 real colors in this one)
-ALIEN_MATRIX_8   = $26  ; hi=2 red (01), lo=6 blue (10)
-ALIEN_COLORRAM_8 = $05  ; green (11)
-ALIEN_MATRIX_9   = $24  ; hi=2 red (01), lo=4 magenta (10) - shared by
-ALIEN_COLORRAM_9 = $04  ; magenta (11) - types 9/10/11 (identical source)
-; Real type 1 (gra=14) - named _1B, not _1, because ALIEN_MATRIX_1/
-; alien_bitmap_1 already belong to real type 3 (gra=18) - see the
-; alien_bitmap_lo/hi header below for how that mislabeling happened.
-ALIEN_MATRIX_1B   = $53  ; hi=5 green (01), lo=3 cyan (10)
-ALIEN_COLORRAM_1B = $02  ; red (11)
-
-alien_bitmap_0:
- .byte $00,$03,$0f,$0d,$25,$25,$09,$02
- .byte $20,$ef,$ff,$55,$55,$55,$55,$56
- .byte $00,$00,$c0,$c0,$60,$60,$80,$00
- .byte $29,$95,$99,$22,$02,$09,$25,$0a
- .byte $55,$55,$55,$56,$66,$65,$89,$02
- .byte $a0,$58,$98,$20,$00,$80,$60,$80
-
-alien_bitmap_1:
- .byte $00,$03,$0d,$35,$d6,$36,$0d,$35
- .byte $cc,$77,$55,$99,$96,$5a,$55,$65
- .byte $00,$00,$c0,$70,$5c,$70,$c0,$70
- .byte $d5,$36,$0d,$35,$d5,$35,$0d,$03
- .byte $a9,$aa,$a9,$65,$55,$75,$cd,$03
- .byte $5c,$70,$c0,$70,$5c,$70,$c0,$00
-
-alien_bitmap_2:
- .byte $00,$02,$02,$02,$02,$00,$00,$00
- .byte $aa,$96,$d7,$55,$55,$96,$28,$28
- .byte $00,$80,$80,$80,$80,$00,$00,$00
- .byte $00,$00,$02,$28,$d6,$d5,$35,$0f
- .byte $28,$aa,$aa,$aa,$28,$82,$c3,$00
- .byte $00,$00,$80,$28,$97,$57,$5c,$f0
-
-alien_bitmap_4:
- .byte $02,$09,$24,$93,$93,$94,$95,$25
- .byte $aa,$55,$00,$c3,$c3,$00,$55,$55
- .byte $80,$60,$18,$c6,$c6,$16,$56,$58
- .byte $0a,$00,$02,$29,$95,$95,$26,$08
- .byte $55,$96,$55,$55,$69,$82,$00,$00
- .byte $a0,$00,$80,$68,$56,$56,$98,$20
-
-alien_bitmap_5:
- .byte $40,$91,$66,$69,$61,$65,$69,$4a
- .byte $88,$a9,$56,$75,$fd,$fd,$fd,$fe
- .byte $04,$18,$64,$a4,$24,$64,$a4,$84
- .byte $c2,$02,$01,$01,$03,$00,$00,$00
- .byte $fe,$ba,$a9,$65,$13,$10,$10,$30
- .byte $0c,$00,$00,$00,$00,$00,$00,$00
-
-alien_bitmap_6:
- .byte $54,$19,$06,$01,$06,$25,$9f,$9d
- .byte $00,$01,$46,$99,$9a,$99,$67,$65
- .byte $54,$90,$40,$00,$40,$60,$d8,$d8
- .byte $65,$1a,$06,$01,$01,$06,$19,$54
- .byte $99,$56,$9a,$a9,$99,$46,$01,$00
- .byte $64,$90,$40,$00,$00,$40,$90,$54
-
-alien_bitmap_7:
- .byte $14,$69,$65,$14,$01,$06,$06,$06
- .byte $00,$01,$01,$54,$a9,$a5,$95,$95
- .byte $50,$84,$94,$50,$00,$40,$40,$40
- .byte $06,$06,$05,$01,$14,$69,$65,$14
- .byte $55,$55,$55,$55,$54,$01,$01,$00
- .byte $40,$40,$40,$00,$50,$a4,$94,$50
-
-alien_bitmap_8:
- .byte $54,$64,$51,$05,$16,$59,$59,$5a
- .byte $10,$54,$69,$aa,$56,$fd,$fd,$56
- .byte $54,$64,$14,$40,$90,$a4,$a4,$a4
- .byte $5a,$6a,$69,$1a,$06,$51,$64,$54
- .byte $aa,$56,$fd,$56,$aa,$a9,$64,$10
- .byte $a4,$a4,$a4,$90,$40,$14,$64,$54
-
-; alien_bitmap_9: real type 9 (gra=30); types 10/11 (gra=32/34) point at
-; the exact same graph-table entry ($2F40, confirmed via direct pointer
-; comparison), so they share this same data - see alien_bitmap_lo/hi.
-alien_bitmap_9:
- .byte $05,$18,$60,$68,$22,$09,$25,$09
- .byte $00,$00,$41,$aa,$55,$55,$55,$55
- .byte $60,$18,$06,$1a,$88,$60,$58,$60
- .byte $09,$25,$09,$22,$68,$60,$18,$05
- .byte $55,$55,$55,$55,$aa,$41,$00,$00
- .byte $60,$58,$60,$88,$1a,$06,$18,$60
-
-; alien_bitmap_1b: real type 1 (gra=14) - the one gap left after the
-; earlier 9-type decode pass, closed the same way (calibrated by
-; re-deriving alien_bitmap_0/2 from O.GRAPHIC and matching them byte-
-; exact before trusting this one). Named _1b, not _1 - see ALIEN_MATRIX_
-; 1B's own comment on why that name is already taken.
-alien_bitmap_1b:
- .byte $15,$50,$51,$15,$05,$04,$04,$05
- .byte $00,$41,$55,$55,$41,$00,$ff,$ff
- .byte $54,$05,$45,$54,$50,$10,$10,$50
- .byte $01,$04,$15,$56,$58,$56,$15,$05
- .byte $7d,$00,$55,$a5,$00,$00,$81,$42
- .byte $40,$20,$58,$56,$16,$56,$58,$a0
-
-; compute_alien_addr: X = alien slot index. Sets temp3 (word) = bitmap
-; address of cell (alien_row[X], alien_col[X]), temp4 (word) = screen-
-; matrix address, temp2 (word) = color-RAM address - identical math to
-; compute_ship_addrs, just against the alien arrays; kept as its own
-; copy rather than shared for the same reason compute_bullet_addr/
-; compute_alien_bullet_addr are separate (no cheap way to pass "which
-; array" into shared code on 6502 without self-modifying code).
-compute_alien_addr:
-    lda alien_disp_col,x
-    sta temp1
-    lda #0
-    sta temp4
-    sta temp4+1
-    lda alien_disp_row,x
-    beq caa_row_done
-    sta length
-caa_row_loop:
-    lda temp4
-    clc
-    adc #40
-    sta temp4
-    lda temp4+1
-    adc #0
-    sta temp4+1
-    dec length
-    bne caa_row_loop
-caa_row_done:
-    lda temp4
-    clc
-    adc temp1
-    sta temp4
-    lda temp4+1
-    adc #0
-    sta temp4+1              ; temp4 = row*40 + col (no page base yet)
-
-    lda temp4
-    sta temp3
-    lda temp4+1
-    sta temp3+1
-    asl temp3
-    rol temp3+1
-    asl temp3
-    rol temp3+1
-    asl temp3
-    rol temp3+1              ; temp3 = (row*40+col) * 8
-    lda temp3
-    clc
-    adc #<$6000
-    sta temp3
-    lda temp3+1
-    adc #>$6000
-    sta temp3+1              ; temp3 = bitmap address
-
-    lda temp4
-    clc
-    adc #<$D800
-    sta temp2
-    lda temp4+1
-    adc #>$D800
-    sta temp2+1              ; temp2 = color-RAM address
-
-    lda temp4
-    clc
-    adc #<$4000
-    sta temp4
-    lda temp4+1
-    adc #>$4000
-    sta temp4+1              ; temp4 = screen-matrix address
-    rts
-
-; draw_alien_x: X = alien slot index. Plain overwrite (STA, not XOR) at
-; the cell(s) it occupies, same reasoning as draw_ship: an alien owns a
-; per-cell screen-matrix/color-RAM override, so XORing its bitmap bits
-; against whatever background (or star) was already there would produce
-; wrong colors, not a clean toggle - see the file header's note on
-; shared-palette (XOR-safe) vs. own-palette (must-own-the-cell)
-; objects. Looks up alien_type,X in the 12-entry bitmap/matrix/colorram
-; tables below (temp3/temp4/temp2 already point at the right cell by
-; compute_alien_addr, called once here, not per-type). Preserves X.
-;
-; First checks both display rows the 2-row-tall sprite would occupy
-; (alien_disp_row,X and +1) against is_row_protected (STARS.asm's same
-; row-0/23/24 HUD check already used for stars and bullets) - if either
-; is protected, the alien's position still updates normally elsewhere
-; (alien_x/alien_y, alien_disp_col/row), it just doesn't get drawn this
-; time, and alien_visible,X is cleared so erase_alien_x knows there's
-; nothing here to undo later. This is the same "logically there, not
-; rendered" treatment move_bullets/move_alien_bullets already use for
-; bullets crossing these rows - own-palette overwrite drawing (unlike
-; XOR) has no self-cancelling way to pass through HUD text/flags without
-; damaging them, so skipping the write entirely is the fix, not XOR.
-;
-; Two overlapping own-palette objects still color-clash where they share
-; a cell (draw_alien_bitmap_generic now gives the lower alien slot a
-; fixed, consistent win there rather than whoever drew most recently -
-; see its own header and is_cell_blocked_by_higher_priority - so the
-; overlap still has a hard edge, but it no longer flickers between the
-; two colors; erase_alien_x/erase_ship separately guard against either
-; of them wiping the other's cells on the way OUT - see erase_alien_x).
-; Tried blending the bitmap via ORA instead, so a background gap in one
-; alien's shape would let the other show through - reverted: the erase-
-; side bookkeeping it required (redraw the surviving object from scratch
-; whenever a shared cell's occupants changed) made overlaps look
-; messier, not cleaner, and cost enough extra per-cell work to be
-; noticeably slower.
-;
-; alien_bitmap_lo/hi/alien_matrix_table/alien_colorram_table: real data
-; for all 12 alien types now, decoded via the same dual-buffer
-; O.GRAPHIC transform verified against the explosion frames and the
-; original 3 alien bitmaps, cross-checked pixel-exact against
-; alien_bitmap_0/2 before being trusted on each new entry (including
-; type 1, the last gap, closed the same way). Real findings worth
-; keeping in mind, not artifacts of this port: type 3 (gra=18) IS
-; alien_bitmap_1 - the original 3-type simplification had already
-; decoded it, just mislabeled as "type 1" (which is why real type 1's
-; own data below is named alien_bitmap_1b, not _1 - that name was
-; already taken by the time the mislabeling was found); type 5 (gra=22)
-; decodes to the SAME raw pixels as the player ship, upside down
-; relative to ship_bitmap (their graph-table blocks are byte-identical
-; once row-reversed) - a real, verified fact about the source data, not
-; something to silently "correct". Types 9/10/11 (gra=30/32/34) all
-; point at the exact same graph-table entry, so they share one bitmap/
-; color entry.
-alien_bitmap_lo:
- .byte <alien_bitmap_0, <alien_bitmap_1b, <alien_bitmap_2, <alien_bitmap_1
- .byte <alien_bitmap_4, <alien_bitmap_5, <alien_bitmap_6, <alien_bitmap_7
- .byte <alien_bitmap_8, <alien_bitmap_9, <alien_bitmap_9, <alien_bitmap_9
-alien_bitmap_hi:
- .byte >alien_bitmap_0, >alien_bitmap_1b, >alien_bitmap_2, >alien_bitmap_1
- .byte >alien_bitmap_4, >alien_bitmap_5, >alien_bitmap_6, >alien_bitmap_7
- .byte >alien_bitmap_8, >alien_bitmap_9, >alien_bitmap_9, >alien_bitmap_9
-alien_matrix_table:
- .byte ALIEN_MATRIX_0, ALIEN_MATRIX_1B, ALIEN_MATRIX_2, ALIEN_MATRIX_1
- .byte ALIEN_MATRIX_4, ALIEN_MATRIX_5, ALIEN_MATRIX_6, ALIEN_MATRIX_7
- .byte ALIEN_MATRIX_8, ALIEN_MATRIX_9, ALIEN_MATRIX_9, ALIEN_MATRIX_9
-alien_colorram_table:
- .byte ALIEN_COLORRAM_0, ALIEN_COLORRAM_1B, ALIEN_COLORRAM_2, ALIEN_COLORRAM_1
- .byte ALIEN_COLORRAM_4, ALIEN_COLORRAM_5, ALIEN_COLORRAM_6, ALIEN_COLORRAM_7
- .byte ALIEN_COLORRAM_8, ALIEN_COLORRAM_9, ALIEN_COLORRAM_9, ALIEN_COLORRAM_9
-
-; dab_type: scratch for draw_alien_bitmap_generic - X (alien slot) and Y
-; (cell-byte offsets) are both busy throughout the actual draw, so the
-; type index lives here instead (dab_ptr, the resolved bitmap pointer,
-; is declared in ZPWORK.asm - it must be zero page for indirect
-; addressing).
-dab_type:
- .byte 0
-
-draw_alien_x:
-    lda swarm_flag
-    bne dax_bitmap
-    rts                         ; sprites draw the aliens (SPRMUX.asm)
-dax_bitmap:
-    lda alien_disp_row,x
-    sta temp1
-    jsr is_row_protected
-    lda star_row_protected
-    bne dax_hidden
-    lda alien_disp_row,x
-    clc
-    adc #1
-    sta temp1
-    jsr is_row_protected
-    lda star_row_protected
-    bne dax_hidden
-
-    lda #1
-    sta alien_visible,x
-    jsr compute_alien_addr
-    lda alien_type,x
-    sta dab_type
-    tay
-    lda alien_bitmap_lo,y
-    sta dab_ptr
-    lda alien_bitmap_hi,y
-    sta dab_ptr+1
-    jmp draw_alien_bitmap_generic
-dax_hidden:
-    lda #0
-    sta alien_visible,x
-    rts
-
-; draw_alien_bitmap_generic: X = alien slot (still the one draw_alien_x
-; was called with - nothing between there and here touches it). Sets
-; dab_type once (draw_alien_cell needs it for both the bitmap-source and
-; matrix/colorram-table lookups, and it doesn't change across the 6
-; cells of one alien), then draws all 6 of this alien's cells - see
-; draw_alien_cell's own header for the per-cell contested-vs-uncontested
-; logic (overwrite with this alien's own color normally, OR-blend with a
-; fixed overlap color when another higher-priority alien already owns a
-; cell).
-draw_alien_bitmap_generic:
-    lda alien_type,x
-    sta dab_type
-    lda #0
-dabg_loop:
-    jsr draw_alien_cell
-    lda dac_cell_idx
-    clc
-    adc #1
-    cmp #6
-    bne dabg_loop
-    rts
-
-; --- Alien/ship "burst" explosion - the REAL BBC explosion sequence
-; (ALIENS3.asm's `.explosion`), decoded from O.GRAPHIC's graph-table
-; entries 0-5 the same way the alien/ship sprites were (row-reversed,
-; 4-bit-nibble dual-buffer format - see the alien graphics section
-; above) and pixel-verified before trusting it on new data: the same
-; transform applied to entries 6/8/9 reproduces alien_bitmap_0/2/1
-; exactly (192/192 cells each), including the same stray-pixel counts
-; already documented for those three, before being applied to entries
-; 0-5. A hand-invented "burst" bitmap was tried twice before this (a
-; uniform fill that read as two flat rectangles, then a corner-blob
-; layout that read as 4 unrelated diamonds) - designing new multicolor
-; pixel data blind, with no way to preview it before a real VICE run,
-; isn't reliable, so this replaces both with the real decode instead of
-; a third guess.
-;
-; The real BBC animation dual-buffer-XOR-composites each frame with the
-; next as algra advances (see ALIENS3.asm); this port draws each frame
-; as a plain overwrite instead (see draw_alien_x's own note on why
-; blending was tried elsewhere and reverted) - still the real 6-frame
-; sequence, just not XOR-composited between frames. Each frame keeps its
-; own 2-color palette (all 6 land on a fire palette - yellow/red/white -
-; with no frame needing a 4th color folded in).
-;
-; draw_explosion_here: temp3/temp4/temp2 already point at the target
-; cell (same convention as draw_alien_bitmap_0/1/2). explosion_frame_num
-; (0-5) selects which real frame to show - set by alien_explode_tick/
-; ship_explode_tick, which advance it once per tick through the cycle.
-; Doesn't touch X (the alien-slot index in alien_explode_tick's caller
-; ma_loop must survive this call) - only Y, for the frame-table lookup
-; and the two band copy loops.
+; draw_explosion_here: temp3/temp4/temp2 already point at the target cell (compute_ship_addrs). explosion_frame_num
+; (0-5) selects the frame, advanced once per tick by ship_explode_tick. Doesn't touch X, only Y.
 explosion_frame_num:
  .byte 0
 explosion_matrix_cur:
@@ -1467,767 +1401,6 @@ deh_bottom:
     sta (temp2),y
     rts
 
-; is_cell_covered: cell_check_col/row/exclude_kind/exclude_idx are inputs
-; (exclude_kind: 0 = the ship itself is asking, 1 = an alien slot is
-; asking, using exclude_idx as that slot so it never counts itself).
-; Returns via cell_check_result (1/0), not a register - erase_alien_x/
-; erase_ship call this X-slot-indexed, and returning through a register
-; would race against the X/Y restore below on the way out. An exploding
-; alien still counts as covering its cells (it's still visually there
-; mid-burst, occupying the same footprint it always did) - but only if
-; it's actually drawn: alien_visible,X is also checked below, so an
-; active alien currently hidden in a protected HUD row (see draw_alien_x/
-; alien_explode_tick) does NOT count as covering anything, since nothing
-; of it is on screen. Without that check, a hidden alien's footprint
-; would make erase_alien_x skip erasing a DIFFERENT, actually-visible
-; alien's old cell when it moved on - the real cause of "leftover alien
-; bits" turning up around the flags, where hidden aliens cluster.
-cell_check_col:
- .byte 0
-cell_check_row:
- .byte 0
-cell_check_exclude_kind:
- .byte 0
-cell_check_exclude_idx:
- .byte 0
-cell_check_result:
- .byte 0
-; cell_check_covering_slot: which alien slot (0-32) was found covering
-; the cell, when cell_check_result=1 - $FF if it was the ship instead
-; (or nothing, when result=0). Lets erase_alien_x's reconstruction path
-; (see its own header) find the specific alien to redraw that cell for,
-; rather than just knowing "something is still there".
-cell_check_covering_slot:
- .byte 0
-
-is_cell_covered:
-    txa
-    pha
-    tya
-    pha
-
-    lda #0
-    sta cell_check_result
-    lda #$FF
-    sta cell_check_covering_slot
-
-icc_skip_ship:
-    ldx #0
-icc_alien_loop:
-    lda cell_check_exclude_kind
-    cmp #1
-    bne icc_check_alien
-    cpx cell_check_exclude_idx
-    beq icc_next_alien          ; this IS the asking alien - skip self
-icc_check_alien:
-    lda alien_active,x
-    beq icc_next_alien
-    lda alien_visible,x        ; active but hidden (in a protected HUD
-    beq icc_next_alien          ; row - see draw_alien_x) draws nothing,
-                                  ; so it can't be covering this cell either
-    lda cell_check_col
-    cmp alien_disp_col,x
-    bcc icc_next_alien
-    sec
-    sbc alien_disp_col,x
-    cmp #3
-    bcs icc_next_alien
-    lda cell_check_row
-    cmp alien_disp_row,x
-    bcc icc_next_alien
-    sec
-    sbc alien_disp_row,x
-    cmp #2
-    bcs icc_next_alien
-    lda #1
-    sta cell_check_result
-    stx cell_check_covering_slot
-    jmp icc_done
-icc_next_alien:
-    inx
-    cpx alien_pool_max         ; not real BBC behavior (this whole
-    bne icc_alien_loop           ; routine is our own invention) - just
-                                   ; no point scanning slots this wave's
-                                   ; pool can never use
-icc_done:
-    pla
-    tay
-    pla
-    tax
-    rts
-
-; cbp_asking_slot/cbp_result: scratch for is_cell_blocked_by_higher_
-; priority below.
-cbp_asking_slot:
- .byte 0
-cbp_result:
- .byte 0
-
-; is_cell_blocked_by_higher_priority: cell_check_col/row are inputs
-; (same meaning as is_cell_covered's), cbp_asking_slot = the alien slot
-; about to draw this cell. Sets cbp_result = 1 if some OTHER active,
-; VISIBLE alien with a LOWER slot index already occupies this cell -
-; lower-slot-wins is an arbitrary but FIXED precedence rule, picked only
-; so two overlapping aliens agree consistently on who owns a shared
-; cell, instead of "whoever's independent movement tick last happened to
-; redraw" - which flips back and forth as the two aliens' own per-move
-; magnitudes (alien_mult) drift in and out of sync, and reads as
-; flicker. Used by draw_alien_bitmap_generic - a blocked cell is left
-; completely untouched (the higher-priority alien's own bitmap/colors
-; there are undisturbed), matching how erase_alien_x already leaves a
-; covered cell untouched on the way out. Preserves X/Y.
-is_cell_blocked_by_higher_priority:
-    txa
-    pha
-    tya
-    pha
-
-    lda #0
-    sta cbp_result
-    ldx #0
-icbp_loop:
-    cpx cbp_asking_slot
-    bcs icbp_next              ; X >= asking slot - not higher priority
-    lda alien_active,x
-    beq icbp_next
-    lda alien_visible,x
-    beq icbp_next
-    lda cell_check_col
-    cmp alien_disp_col,x
-    bcc icbp_next
-    sec
-    sbc alien_disp_col,x
-    cmp #3
-    bcs icbp_next
-    lda cell_check_row
-    cmp alien_disp_row,x
-    bcc icbp_next
-    sec
-    sbc alien_disp_row,x
-    cmp #2
-    bcs icbp_next
-    lda #1
-    sta cbp_result
-    jmp icbp_done
-icbp_next:
-    inx
-    cpx alien_pool_max         ; same reasoning as is_cell_covered's own
-    bne icbp_loop                 ; bound above - not real BBC behavior,
-                                   ; just an optimization
-icbp_done:
-    pla
-    tay
-    pla
-    tax
-    rts
-
-; ALIEN_OVERLAP_MATRIX/COLORRAM: the fixed color a contested cell shows,
-; instead of whichever alien's own palette happened to still be sitting
-; there. Solid white in this port's multicolor scheme (hi/lo nibble and
-; color-RAM all pick the same code) - reads as a deliberate "these are
-; touching" indicator rather than an arbitrary mismatched color.
-ALIEN_OVERLAP_MATRIX = $11
-ALIEN_OVERLAP_COLORRAM = 1
-
-; dac_dest_lo/hi, dac_src_off, dac_y_off, dac_dx/dy: per-cell-index
-; (0=TL,1=TM,2=TR,3=BL,4=BM,5=BR - same layout the old unrolled
-; draw_alien_bitmap_generic/erase_alien_x blocks used) lookup tables for
-; draw_alien_cell below. dac_dest_*: byte offset from the alien's
-; top-left bitmap address (compute_alien_addr) to this cell's bitmap
-; address - 0/8/16 across the top row, 320/328/336 across the bottom
-; row (the same "+8,+8,+304,+8,+8" walk erase_alien_x's old unrolled
-; code used, just expressed as absolute offsets from the top-left
-; instead of a running total). dac_src_off: byte offset into the
-; alien's SOURCE bitmap data for this cell - contiguous regardless of
-; row (0,8,16,24,32,40), since the source is laid out as 2 packed rows
-; of 3 cells, unlike the 320-byte-stride destination. dac_y_off: the
-; screen-matrix/color-RAM byte offset for this cell (0,1,2,40,41,42).
-; dac_dx/dy: this cell's offset from the alien's own disp_col/disp_row,
-; needed to build cell_check_col/row for the contestation check.
-dac_dest_lo:
- .byte <0,<8,<16,<320,<328,<336
-dac_dest_hi:
- .byte >0,>8,>16,>320,>328,>336
-dac_src_off:
- .byte 0,8,16,24,32,40
-dac_y_off:
- .byte 0,1,2,40,41,42
-dac_dx:
- .byte 0,1,2,0,1,2
-dac_dy:
- .byte 0,0,0,1,1,1
-
-dac_cell_idx:
- .byte 0
-dac_saved_x:
- .byte 0
-dac_y_offset:
- .byte 0
-
-; draw_alien_cell: X = alien slot, A = which of its 6 relative cells
-; (see the table header above). dab_type must already be set (=
-; alien_type,X - draw_alien_bitmap_generic sets it once and reuses it
-; across all 6 calls; erase_alien_x's reconstruction path sets it fresh
-; for whichever alien it's reconstructing).
-;
-; Draws just that one cell: if is_cell_blocked_by_higher_priority says
-; no other active/visible alien with a lower slot already owns it,
-; overwrites normally with this alien's own bitmap/colors (the original
-; behavior). If it IS contested, ORs this alien's bitmap bits into
-; whatever's already there instead of overwriting (so neither shape
-; gets a rectangular bite taken out of it) and paints the cell
-; ALIEN_OVERLAP_MATRIX/COLORRAM instead of either alien's own color -
-; the color is wrong for whichever alien doesn't own the cell either
-; way, but the shape stays intact and the mismatch is a deliberate,
-; consistent color rather than "whichever alien's palette happened to
-; still be there". See draw_alien_x's header for why real per-alien
-; color correctness in a shared cell isn't achievable on this hardware
-; at all (one color set per 8x8 cell, shared by every pixel in it).
-;
-; Shared by draw_alien_bitmap_generic (calls this 6 times, once per
-; cell, for the alien that's moving) and erase_alien_x's reconstruction
-; path (calls this once, for whichever alien is found still covering a
-; cell after a DIFFERENT alien that used to share it has gone - a
-; contested cell can't just be left alone on erase the way an
-; uncontested one can, since the departing alien's ORed-in bits would
-; stay stuck there forever otherwise; erase_alien_x blanks the cell
-; first, then calls this to rebuild it from whichever alien(s) actually
-; still belong there).
-draw_alien_cell:
-    sta dac_cell_idx
-    stx dac_saved_x
-
-    jsr compute_alien_addr        ; temp2/3/4 = this alien's TOP-LEFT
-                                    ; cell addresses - doesn't touch X
-    ldx dac_saved_x
-    ldy dac_cell_idx
-
-    lda temp3
-    clc
-    adc dac_dest_lo,y
-    sta temp3
-    lda temp3+1
-    adc dac_dest_hi,y
-    sta temp3+1
-
-    lda dac_y_off,y
-    sta dac_y_offset
-
-    lda alien_disp_col,x
-    clc
-    adc dac_dx,y
-    sta cell_check_col
-    lda alien_disp_row,x
-    clc
-    adc dac_dy,y
-    sta cell_check_row
-
-    stx cbp_asking_slot
-    jsr is_cell_blocked_by_higher_priority   ; preserves X/Y
-
-    ldy dac_cell_idx
-    ldx dab_type
-    lda alien_bitmap_lo,x
-    clc
-    adc dac_src_off,y
-    sta dab_ptr
-    lda alien_bitmap_hi,x
-    adc #0
-    sta dab_ptr+1
-    ldx dac_saved_x
-
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_evict_range          ; preserves X/Y
-
-    lda cbp_result
-    bne dac_blend
-
-    ldy #0
-dac_own_loop:
-    lda (dab_ptr),y
-    sta (temp3),y
-    iny
-    cpy #8
-    bne dac_own_loop
-
-    ldx dab_type
-    lda alien_matrix_table,x
-    ldy dac_y_offset
-    sta (temp4),y
-    ldx dab_type
-    lda alien_colorram_table,x
-    ldy dac_y_offset
-    sta (temp2),y
-    ldx dac_saved_x
-    rts
-
-dac_blend:
-    ldy #0
-dac_blend_loop:
-    lda (dab_ptr),y
-    ora (temp3),y
-    sta (temp3),y
-    iny
-    cpy #8
-    bne dac_blend_loop
-
-    ldy dac_y_offset
-    lda #ALIEN_OVERLAP_MATRIX
-    sta (temp4),y
-    ldy dac_y_offset
-    lda #ALIEN_OVERLAP_COLORRAM
-    sta (temp2),y
-    ldx dac_saved_x
-    rts
-
-; eax_recon_dx/eax_saved_x: scratch for erase_alien_x's reconstruction
-; detour below.
-eax_recon_dx:
- .byte 0
-eax_saved_x:
- .byte 0
-
-; eax_compute_local_cell: X must already = the covering alien's slot
-; (cell_check_covering_slot). Returns in A which of ITS 6 relative
-; cells corresponds to the current cell_check_col/row - already
-; verified by is_cell_covered to be within that alien's 3x2 footprint,
-; so dx/dy are always in range. Same 0=TL..5=BR indexing draw_alien_cell
-; uses.
-eax_compute_local_cell:
-    lda cell_check_col
-    sec
-    sbc alien_disp_col,x
-    sta eax_recon_dx
-    lda cell_check_row
-    sec
-    sbc alien_disp_row,x
-    beq eax_local_dy0
-    lda #3
-    clc
-    adc eax_recon_dx
-    rts
-eax_local_dy0:
-    lda eax_recon_dx
-    rts
-
-; erase_alien_x: X = alien slot index. Per-cell guarded erase, not a
-; blanket 2x24-byte reset - for each of the 6 cells this alien occupies:
-;   - if NOTHING else covers it (is_cell_covered), resets it to plain
-;     background, same as always.
-;   - if the SHIP covers it, leaves it completely untouched (unrelated
-;     system, own erase/draw path).
-;   - if another ALIEN still covers it, blanks the cell and calls
-;     draw_alien_cell to rebuild it fresh from that alien alone (see
-;     draw_alien_cell's own header on why a contested cell can't just be
-;     left alone the way an uncontested one can - the departing alien's
-;     ORed-in bits would otherwise stay stuck there forever).
-; A cell that's genuinely reset to background also gets
-; star_restore_range'd for its own 8-byte range, redrawing any star that
-; had been evicted from it (see star_evict_range in STARS.asm) - the fix
-; for stuck stars. X survives every jsr below untouched: is_cell_covered,
-; star_restore_range and the reconstruction detour (which explicitly
-; saves/restores it via eax_saved_x) all leave X as the ORIGINAL alien
-; slot by the time each cell block ends, so alien_disp_col,x/
-; alien_disp_row,x stay correctly indexed throughout.
-;
-; First checks alien_visible,X: if draw_alien_x last skipped drawing
-; this alien (a protected HUD row - see its own header), there is
-; nothing on screen to erase, and erasing anyway would blank whatever
-; real content (score bar/flags) is actually sitting in those cells.
-erase_alien_x:
-    lda alien_visible,x
-    bne eax_do_erase
-    rts
-eax_do_erase:
-    jsr compute_alien_addr
-
-    ; cell 0: top-left (disp_col+0, disp_row+0), temp3+0, matrix/color y=0
-    lda alien_disp_col,x
-    sta cell_check_col
-    lda alien_disp_row,x
-    sta cell_check_row
-    lda #1
-    sta cell_check_exclude_kind
-    stx cell_check_exclude_idx
-    jsr is_cell_covered
-    lda cell_check_result
-    beq eax_c0_normal
-    lda cell_check_covering_slot
-    cmp #$FF
-    beq eax_c0_skip
-    stx eax_saved_x
-    lda #0
-    ldy #0
-eax_c0_blank_loop:
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c0_blank_loop
-    ldx cell_check_covering_slot
-    jsr eax_compute_local_cell
-    pha
-    lda alien_type,x
-    sta dab_type
-    ldx cell_check_covering_slot
-    pla
-    jsr draw_alien_cell
-    ldx eax_saved_x
-    jmp eax_c0_skip
-eax_c0_normal:
-    ldy #0
-eax_c0_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c0_erase
-    lda #$73
-    ldy #0
-    sta (temp4),y
-    lda #4
-    ldy #0
-    sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-eax_c0_skip:
-
-    ; cell 1: top-mid (disp_col+1, disp_row+0), temp3+8, matrix/color y=1
-    lda temp3
-    clc
-    adc #8
-    sta temp3
-    lda temp3+1
-    adc #0
-    sta temp3+1
-    lda alien_disp_col,x
-    clc
-    adc #1
-    sta cell_check_col
-    lda alien_disp_row,x
-    sta cell_check_row
-    lda #1
-    sta cell_check_exclude_kind
-    stx cell_check_exclude_idx
-    jsr is_cell_covered
-    lda cell_check_result
-    beq eax_c1_normal
-    lda cell_check_covering_slot
-    cmp #$FF
-    beq eax_c1_skip
-    stx eax_saved_x
-    lda #0
-    ldy #0
-eax_c1_blank_loop:
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c1_blank_loop
-    ldx cell_check_covering_slot
-    jsr eax_compute_local_cell
-    pha
-    lda alien_type,x
-    sta dab_type
-    ldx cell_check_covering_slot
-    pla
-    jsr draw_alien_cell
-    ldx eax_saved_x
-    jmp eax_c1_skip
-eax_c1_normal:
-    ldy #0
-eax_c1_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c1_erase
-    lda #$73
-    ldy #1
-    sta (temp4),y
-    lda #4
-    ldy #1
-    sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-eax_c1_skip:
-
-    ; cell 2: top-right (disp_col+2, disp_row+0), temp3+16, y=2
-    lda temp3
-    clc
-    adc #8
-    sta temp3
-    lda temp3+1
-    adc #0
-    sta temp3+1
-    lda alien_disp_col,x
-    clc
-    adc #2
-    sta cell_check_col
-    lda alien_disp_row,x
-    sta cell_check_row
-    lda #1
-    sta cell_check_exclude_kind
-    stx cell_check_exclude_idx
-    jsr is_cell_covered
-    lda cell_check_result
-    beq eax_c2_normal
-    lda cell_check_covering_slot
-    cmp #$FF
-    beq eax_c2_skip
-    stx eax_saved_x
-    lda #0
-    ldy #0
-eax_c2_blank_loop:
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c2_blank_loop
-    ldx cell_check_covering_slot
-    jsr eax_compute_local_cell
-    pha
-    lda alien_type,x
-    sta dab_type
-    ldx cell_check_covering_slot
-    pla
-    jsr draw_alien_cell
-    ldx eax_saved_x
-    jmp eax_c2_skip
-eax_c2_normal:
-    ldy #0
-eax_c2_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c2_erase
-    lda #$73
-    ldy #2
-    sta (temp4),y
-    lda #4
-    ldy #2
-    sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-eax_c2_skip:
-
-    ; cell 3: bottom-left (disp_col+0, disp_row+1), temp3+320, y=40
-    lda temp3
-    clc
-    adc #<304
-    sta temp3
-    lda temp3+1
-    adc #>304
-    sta temp3+1
-    lda alien_disp_col,x
-    sta cell_check_col
-    lda alien_disp_row,x
-    clc
-    adc #1
-    sta cell_check_row
-    lda #1
-    sta cell_check_exclude_kind
-    stx cell_check_exclude_idx
-    jsr is_cell_covered
-    lda cell_check_result
-    beq eax_c3_normal
-    lda cell_check_covering_slot
-    cmp #$FF
-    beq eax_c3_skip
-    stx eax_saved_x
-    lda #0
-    ldy #0
-eax_c3_blank_loop:
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c3_blank_loop
-    ldx cell_check_covering_slot
-    jsr eax_compute_local_cell
-    pha
-    lda alien_type,x
-    sta dab_type
-    ldx cell_check_covering_slot
-    pla
-    jsr draw_alien_cell
-    ldx eax_saved_x
-    jmp eax_c3_skip
-eax_c3_normal:
-    ldy #0
-eax_c3_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c3_erase
-    lda #$73
-    ldy #40
-    sta (temp4),y
-    lda #4
-    ldy #40
-    sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-eax_c3_skip:
-
-    ; cell 4: bottom-mid (disp_col+1, disp_row+1), temp3+328, y=41
-    lda temp3
-    clc
-    adc #8
-    sta temp3
-    lda temp3+1
-    adc #0
-    sta temp3+1
-    lda alien_disp_col,x
-    clc
-    adc #1
-    sta cell_check_col
-    lda alien_disp_row,x
-    clc
-    adc #1
-    sta cell_check_row
-    lda #1
-    sta cell_check_exclude_kind
-    stx cell_check_exclude_idx
-    jsr is_cell_covered
-    lda cell_check_result
-    beq eax_c4_normal
-    lda cell_check_covering_slot
-    cmp #$FF
-    beq eax_c4_skip
-    stx eax_saved_x
-    lda #0
-    ldy #0
-eax_c4_blank_loop:
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c4_blank_loop
-    ldx cell_check_covering_slot
-    jsr eax_compute_local_cell
-    pha
-    lda alien_type,x
-    sta dab_type
-    ldx cell_check_covering_slot
-    pla
-    jsr draw_alien_cell
-    ldx eax_saved_x
-    jmp eax_c4_skip
-eax_c4_normal:
-    ldy #0
-eax_c4_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c4_erase
-    lda #$73
-    ldy #41
-    sta (temp4),y
-    lda #4
-    ldy #41
-    sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-eax_c4_skip:
-
-    ; cell 5: bottom-right (disp_col+2, disp_row+1), temp3+336, y=42
-    lda temp3
-    clc
-    adc #8
-    sta temp3
-    lda temp3+1
-    adc #0
-    sta temp3+1
-    lda alien_disp_col,x
-    clc
-    adc #2
-    sta cell_check_col
-    lda alien_disp_row,x
-    clc
-    adc #1
-    sta cell_check_row
-    lda #1
-    sta cell_check_exclude_kind
-    stx cell_check_exclude_idx
-    jsr is_cell_covered
-    lda cell_check_result
-    beq eax_c5_normal
-    lda cell_check_covering_slot
-    cmp #$FF
-    beq eax_c5_skip
-    stx eax_saved_x
-    lda #0
-    ldy #0
-eax_c5_blank_loop:
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c5_blank_loop
-    ldx cell_check_covering_slot
-    jsr eax_compute_local_cell
-    pha
-    lda alien_type,x
-    sta dab_type
-    ldx cell_check_covering_slot
-    pla
-    jsr draw_alien_cell
-    ldx eax_saved_x
-    jmp eax_c5_skip
-eax_c5_normal:
-    ldy #0
-eax_c5_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne eax_c5_erase
-    lda #$73
-    ldy #42
-    sta (temp4),y
-    lda #4
-    ldy #42
-    sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-eax_c5_skip:
-    lda #0
-    sta alien_visible,x
-    rts
-
 ; ALIEN_COUNT=33: sized for the real game's largest per-wave pool, not a
 ; typical one - see wave_pool_size/alien_pool_max below. Real waves
 ; normally use 7-10 concurrent aliens; group 45 (reachable in waves
@@ -2272,18 +1445,6 @@ alien_type:
 alien_disp_col:
  .res ALIEN_COUNT
 alien_disp_row:
- .res ALIEN_COUNT
-; alien_visible: 1 if this alien's cells currently hold its own drawn
-; pixels, 0 if draw_alien_x last skipped drawing it (its footprint
-; overlapped a protected HUD row - see draw_alien_x/erase_alien_x). Lets
-; erase_alien_x tell a genuine "nothing to erase" apart from "erase like
-; normal" without re-deriving it from disp_row (which by erase time may
-; already reflect a still-protected position that was never drawn to
-; begin with). Not `.res`-zeroed for a reason: every spawn path
-; (pas_spawn/alien_spawn_child) calls draw_alien_x immediately after
-; activating a slot, which sets this correctly before anything could
-; read it - an alien is never erased before its first draw.
-alien_visible:
  .res ALIEN_COUNT
 alien_x:
  .res ALIEN_COUNT
@@ -2344,57 +1505,13 @@ init_alien_hp:
     tay
     rts
 
-; alien_explode_tick: X = alien slot, already known to be exploding.
-; alien_explode_timer,X counts UP as a frame index (0..5) through the
-; real 6-frame explosion sequence - each draw is a full overwrite (see
-; draw_alien_x's header on why draw isn't blended), so no erase is
-; needed between frames, only once at the very end. Deactivates the slot
-; for real once all 6 frames have shown.
-;
-; Checks the same 2-row protection draw_alien_x does before drawing a
-; frame - draw_explosion_here used to skip that check entirely (it's a
-; separate call path from draw_alien_x, not routed through it), so an
-; alien that died while hidden in a protected row would still flash 6
-; explosion frames directly onto the score bar/flags, and since
-; alien_visible stayed 0 (last set by draw_alien_x while hidden),
-; aet_finish's erase_alien_x saw "nothing to erase" and never cleaned up
-; the last frame - the actual cause of the leftover alien debris seen in
-; the bottom-left flags area. An alien doesn't move while exploding
-; (this tick never touches alien_x/alien_y), so the protected/not
-; protected state is the same every frame - checking it each tick anyway
-; is cheap and keeps this in lockstep with alien_visible without extra
-; state.
+; alien_explode_tick: X = alien slot, already known to be exploding. alien_explode_timer,X counts UP as a frame index
+; (0..5) through the real 6-frame explosion sequence, which the sprite multiplexer shows (spr_build reads the
+; timer); the slot is freed once all 6 frames have shown.
 alien_explode_tick:
     lda alien_explode_timer,x
     cmp #EXPLOSION_FRAME_COUNT
     bcs aet_finish
-    lda swarm_flag
-    beq aet_advance             ; sprites show the explosion frames
-
-    lda alien_disp_row,x
-    sta temp1
-    jsr is_row_protected
-    lda star_row_protected
-    bne aet_skip_frame
-    lda alien_disp_row,x
-    clc
-    adc #1
-    sta temp1
-    jsr is_row_protected
-    lda star_row_protected
-    bne aet_skip_frame
-
-    lda #1
-    sta alien_visible,x
-    lda alien_explode_timer,x
-    sta explosion_frame_num
-    jsr compute_alien_addr
-    jsr draw_explosion_here
-    jmp aet_advance
-aet_skip_frame:
-    lda #0
-    sta alien_visible,x
-aet_advance:
     inc alien_explode_timer,x
     rts
 aet_finish:
@@ -2402,7 +1519,6 @@ aet_finish:
     sta alien_active,x
     sta alien_exploding,x
     dec alien_live_count
-    jsr erase_alien_x
     rts
 
 ; alien_spawn_table: ALL 46 real spawn groups (PATT.asm's patt0-patt45),
@@ -2428,7 +1544,7 @@ aet_finish:
 ; checks it), so real spawns like patt4/6/7/23/24/25/26's y=231/255 are
 ; genuine, valid BBC positions, not overflow - clamping them distorted
 ; the source data. Scaling the real row onto our shorter screen instead
-; of clamping it happens at RUNTIME now, in row_scale_table (see its own
+; of clamping it happens at RUNTIME now, in y_to_row (see its own
 ; header, near alien_refresh_display) - this table keeps the real,
 ; unscaled row so the master data stays exactly what PATT.asm says.
 ; type: (gra-12)/2 - the real ALIENS2.asm indexing formula (traced from
@@ -2595,19 +1711,9 @@ wave_off:
 ; start of this wave's group list. No longer expands any groups itself
 ; - try_load_next_group does that now, one real wave-list entry at a
 ; time, same as the real ALIENS1.asm.
-; swarm_flag: 1 while the current wave's spawn group 45 (the 32-alien swarm) is on. Aliens are sprites
-; (SPRMUX.asm) except then, when they are drawn in the bitmap as before (the rows are 19 lines apart,
-; closer than a sprite can be re-used).
-swarm_flag:
- .byte 0
-
 init_alien_wave:
     ldx #0
 iaw_clear:
-    lda alien_active,x
-    beq iaw_clear_next
-    jsr erase_alien_x
-iaw_clear_next:
     lda #0
     sta alien_active,x
     inx
@@ -2627,7 +1733,6 @@ iaw_clear_slots:
     sta alien_live_count
     sta alien_bullet_live_count
     sta wave_off
-    sta swarm_flag
 
     lda c64_curwave
     and #15
@@ -2692,8 +1797,6 @@ tlng_wave_not_done:
     ; on the next wave transition.
     cpx #45
     bne tlng_not_special
-    lda #1
-    sta swarm_flag            ; the 32-alien swarm is drawn in the bitmap, not as sprites
     lda #33
     sta alien_pool_max
     lda #32
@@ -2828,11 +1931,7 @@ pas_spawn:
     sta alien_disp_col,x        ; rendered cell = raw x / 4
     lda alien_spawn_cur_y,y
     sta alien_y,x
-    lsr a
-    lsr a
-    lsr a
-    tay
-    lda row_scale_table,y
+    jsr y_to_row
     sta alien_disp_row,x        ; rendered cell = scaled real row
 
     ldy temp1                  ; back to the table's group*8 offset for
@@ -2865,7 +1964,6 @@ pas_spawn:
     adc length
     sta alien_spawn_cur_y,y
 
-    jsr draw_alien_x
 pas_next:
     inc pas_slot
     lda pas_slot
@@ -2892,8 +1990,18 @@ c64_curwave:
 ; try_load_next_group.
 advance_to_next_wave:
     inc c64_curwave
-    lda #1                      ; tune 1 = Zone/wave music
-    jsr start_tune
+    lda demo_flag                ; ALIENS1.asm: the between-levels tune, or the zone tune every 16th wave
+    bne anw_no_tune
+    lda c64_curwave
+    and #15
+    bne anw_between
+    lda #MUS_ZONE
+    bne anw_tune
+anw_between:
+    lda #MUS_BETWEEN
+anw_tune:
+    jsr music_start
+anw_no_tune:
     inc level_ones
     jsr draw_level_flags
     jsr init_alien_wave
@@ -3171,7 +2279,13 @@ aei_end_loop:
     jmp alien_exec_instr
 
 aei_dropbomb:
+    stx afb_saved_x              ; ALIENS4.asm's dat_dropbomb: only one time in four
+    jsr demo_rand
+    ldx afb_saved_x
+    and #3
+    bne aei_nobomb
     jsr alien_fire_bomb
+aei_nobomb:
     jmp alien_exec_instr
 
 ; alien_fire_bomb: X = firing alien's slot (preserved). Spawns into the
@@ -3189,9 +2303,14 @@ afb_target_col:
  .byte 0
 afb_saved_x:
  .byte 0
+afb_slot:
+ .byte 0
 
 alien_fire_bomb:
     stx afb_saved_x
+    lda c64_curwave              ; BOMBS2.asm's init_bomb: none in the first three waves
+    cmp #3
+    bcc afb_drop
     lda alien_disp_row,x
     clc
     adc #2
@@ -3212,6 +2331,19 @@ afb_find_slot:
     bne afb_find_slot
     jmp afb_drop              ; pool full
 afb_spawn:
+    stx afb_slot
+    ldy afb_saved_x              ; speed: a bomb dropped from the top of the screen is fast or slow at random, one
+    lda alien_y,y                ; dropped lower is always slow
+    clc
+    adc #8
+    and #$F8
+    cmp #80
+    lda #0
+    bcs afb_speed
+    jsr demo_rand
+afb_speed:
+    ldx afb_slot
+    sta alien_bullet_fast,x
     lda #1
     sta alien_bullet_active,x
     inc alien_bullet_live_count
@@ -3228,7 +2360,6 @@ aei_die:
     lda #0
     sta alien_active,x
     dec alien_live_count
-    jsr erase_alien_x
     rts
 
 aei_newalien:
@@ -3293,12 +2424,8 @@ asc_spawn:
     adc #8                    ; real ALIENS4.asm's dat_newalien: "LDAaly,
     sta alien_y,x               ; X:ADC#8:STAaly,Y" - no clamp in the
                                   ; source, and none needed now that Y is
-                                  ; unbounded (see row_scale_table)
-    lsr a
-    lsr a
-    lsr a
-    tay
-    lda row_scale_table,y
+                                  ; unbounded (see y_to_row)
+    jsr y_to_row
     sta alien_disp_row,x      ; derived from the real Y (scaled for
                                ; display), not copied from the parent's
                                ; own already-scaled disp_row
@@ -3306,62 +2433,33 @@ asc_spawn:
     sta alien_mult,x
     lda asc_pattern
     jsr alien_select_pattern
-    jsr draw_alien_x
     ldx asc_parent
     rts
 
-; alien_refresh_display: X = alien slot. Redraws (erase old cell, draw
-; new) only if alien_x/alien_y's derived cell (x/4, y/8) differs from
-; what's currently rendered (alien_disp_col/row,X) - shared by
-; alien_apply_move (after a compass step) and aei_mve (direct
-; reposition).
-; ard_new_col/ard_new_row are dedicated, not the usual length/temp1
-; scratch: erase_alien_x (below) calls compute_alien_addr, which uses
-; BOTH length (its row-multiply loop counter) and temp1 (its col
-; holder) internally - saving the new position in either of those and
-; then calling erase_alien_x would get it clobbered before it was read
-; back. This was the actual cause of the corruption: alien_disp_col/row
-; were ending up set from whatever compute_alien_addr's loop happened
-; to leave behind, not the real new position, so aliens drew at wrong
-; cells while their old position was left un-erased.
+; alien_refresh_display: X = alien slot. Updates the cell the alien occupies (alien_disp_col/row,X: what the collision
+; tests use) from alien_x/alien_y - shared by alien_apply_move (after a compass step) and aei_mve (direct
+; reposition). Aliens are sprites, so nothing is drawn; the multiplexer reads alien_x/alien_y itself.
+; ard_new_col/ard_new_row are dedicated scratch bytes: y_to_row clobbers Y and the callers keep their state in
+; length/temp1.
 ard_new_col:
  .byte 0
 ard_new_row:
  .byte 0
 
-; row_scale_table: real BBC row (0-31, alien_y/8 - the BBC screen is
-; 256 scanlines/32 rows tall, confirmed against ROUT1.asm's own
-; line_start/line_starth, 32 entries) -> our displayable row (0-24, our
-; screen is 200 scanlines/25 rows). A straight clamp (deactivating an
-; alien once its row left a fixed safe band) was a design decision that
-; was never checked - real Y is unbounded on the BBC, and forcing a
-; kill instead of just scaling the position was inventing behavior, not
-; porting it. This scales instead, but the boundary needs care: real
-; xycalc's "CPY#23" guard only protects scanlines 0-22 (partway through
-; real row 2), so real row 3 is fully valid on the BBC. This table was
-; originally built to also avoid OUR row 3 as a display target, on the
-; belief that is_row_protected reserved it for the score bar - that
-; belief turned out to be wrong (is_row_protected's row check was itself
-; a bug: the score bar is drawn at row 0, not row 3 - see its own header
-; in STARS.asm) but leaving real rows 3-29 (27 rows) scaled onto our
-; rows 4-22 (19 rows) instead of 3-22 is harmless either way, just one
-; row of unused display precision, so the mapping numbers below are left
-; as-is rather than re-tuned. The real HUD-overlap problem this was
-; trying to solve is now handled directly at draw time instead (see
-; draw_alien_x/erase_alien_x's own is_row_protected checks), which works
-; regardless of how this table happens to map real rows to display rows.
-; Rows 30-31 (both screens' bottom HUD, verified
-; via flagson's addres/addres1 matching line_start[30]/[31] exactly)
-; still map 1:1 to our 23-24. Real rows 0-2 never occur in any actual
-; spawn/movement data (verified - nothing in alien_spawn_table goes
-; below real row 3) so their exact mapping doesn't matter in practice;
-; kept as identity just so the table has no entry that could be unsafe
-; if that ever changes. Used both here and at spawn (pas_spawn) -
-; alien_y/alien_spawn_cur_y always hold the real, unscaled scanline
-; position; only the DISPLAY row goes through this table.
-row_scale_table:
- .byte 0,1,2,4,5,5,6,7,7,8,9,10,10,11,12,12
- .byte 13,14,14,15,16,16,17,18,19,19,20,21,21,22,23,24
+; y_to_row: A = an alien's real BBC scanline (alien_y) -> A = the display cell row (0-24) it is on, through the same
+; scanline -> screen line map the sprites use (spr_ymap in gen/tables.inc), so the collision cells follow what is
+; drawn. Clobbers Y.
+y_to_row:
+    tay
+    lda spr_ymap,y
+    lsr a
+    lsr a
+    lsr a
+    cmp #25
+    bcc ytr_ok
+    lda #24
+ytr_ok:
+    rts
 
 alien_refresh_display:
     lda alien_x,x
@@ -3369,11 +2467,7 @@ alien_refresh_display:
     lsr a
     sta ard_new_col
     lda alien_y,x
-    lsr a
-    lsr a
-    lsr a
-    tay
-    lda row_scale_table,y
+    jsr y_to_row
     sta ard_new_row
 
     lda ard_new_col
@@ -3383,12 +2477,10 @@ alien_refresh_display:
     cmp alien_disp_row,x
     beq ard_done
 ard_redraw:
-    jsr erase_alien_x
     lda ard_new_col
     sta alien_disp_col,x
     lda ard_new_row
     sta alien_disp_row,x
-    jsr draw_alien_x
 ard_done:
     rts
 
@@ -3420,7 +2512,7 @@ wxm_done:
 ; ALIENS3.asm never bounds-checks it either). alien_y/alien_spawn_cur_y
 ; hold this real, unscaled position - only alien_refresh_display (and
 ; pas_spawn, at first draw) convert it to a displayable row, via
-; row_scale_table. See that table's own header for why a fixed
+; y_to_row. A fixed
 ; deactivate-at-row-23 floor/ceiling was replaced with real-time
 ; scaling instead.
 ;
@@ -3553,26 +2645,26 @@ amt_rts:
 ; for aliens - "maximize play area vs BBC" - rather than the ship being
 ; able to wander anywhere onscreen.
 SHIP_START_ROW  = 20
+
+; ship_home_row: the row the ship starts a life on. In the demo it sits on the very bottom row (a port choice: the
+; demo never moves up or down, and down there it is clear of the aliens).
+ship_home_row:
+    lda demo_flag
+    beq shr_game
+    lda #SHIP_MAX_ROW
+    rts
+shr_game:
+    lda #SHIP_START_ROW
+    rts
+
 SHIP_START_COL  = 18
 SHIP_MIN_COL    = 0
 SHIP_MAX_COL    = 37     ; 40 cells - 3 wide
 SHIP_MIN_ROW    = 16
-SHIP_MAX_ROW    = 21     ; ship's bottom row stays off row 23 (flags/lives)
+SHIP_MAX_ROW    = 23     ; the ship is a sprite now, so it may fly over the flags/lives rows as the original's does (it
+                         ; reaches scanline 234 of 256 = line ~183 of 200)
 SHIP_MATRIX_BYTE   = $17 ; hi-nibble=1 (white, pattern 01), lo-nibble=7 (yellow, pattern 10)
 SHIP_COLORRAM_BYTE = $03 ; cyan (pattern 11)
-
-; Rows run bottom-to-top in the source data (the BBC plotter counts the
-; screen address DOWN as it walks forward through the bytes), so this is
-; the decoded data with row order reversed from the first pass - that
-; first pass had the engine/exhaust end on top and the nose on the
-; bottom, i.e. upside down.
-ship_bitmap:
- .byte $00,$00,$00,$03,$01,$01,$02,$c2
- .byte $30,$10,$10,$13,$65,$a9,$ba,$fe
- .byte $00,$00,$00,$00,$00,$00,$00,$0c
- .byte $4a,$69,$65,$61,$69,$66,$91,$40
- .byte $fe,$fd,$fd,$fd,$75,$56,$a9,$88
- .byte $84,$a4,$64,$24,$a4,$64,$18,$04
 
 ; compute_ship_addrs: A = leftmost column (0-39) of the ship's 3-cell
 ; span; ship_row (0-24) = its top row. Sets temp3 (word) = bitmap
@@ -3650,8 +2742,8 @@ csa_row40_done:
 
 ; draw_ship / erase_ship: the ship is hardware sprite 7 (SPRMUX.asm). draw_ship (re)positions it from
 ; ship_col/ship_row; erase_ship does nothing because a move is just draw_ship at the new cell, and ship_hide
-; takes it off the screen. The old bitmap versions live on as draw_ship_cells/erase_ship_cells: the ship's
-; explosion is still drawn in the bitmap, and erase_ship_cells clears it afterwards.
+; takes it off the screen. The old bitmap erase lives on as erase_ship_cells: the ship's explosion is
+; still drawn in the bitmap, and erase_ship_cells clears it afterwards.
 draw_ship:
     jmp spr_ship_show
 
@@ -3661,157 +2753,50 @@ erase_ship:
 ship_hide:
     jmp spr_ship_hide
 
-; the bitmap version, no longer called: the ship is a sprite (see above)
-draw_ship_cells:
-    lda ship_col
-    jsr compute_ship_addrs
+; erase_ship_cells: blanks the 3x2 cells of the ship's burst (the explosion is drawn in the bitmap) and puts back
+; any star the burst had hidden there.
+esc_cell:
+ .byte 0
+esc_moff:                       ; matrix/colour-RAM offset of each of the 6 cells
+ .byte 0,1,2,40,41,42
+esc_boff_lo:                    ; bitmap offset of each, low and high byte (8 bytes a cell, 320 a row)
+ .byte 0,8,16,64,72,80
+esc_boff_hi:
+ .byte 0,0,0,1,1,1
+esc_base_lo:
+ .byte 0
+esc_base_hi:
+ .byte 0
 
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #24
-    sta sce_range_len
-    jsr star_evict_range      ; preserves X - dsh_top/dsh_bottom below
-                               ; share one running index (0-47) through X,
-                               ; which must survive this call untouched
-
-    ldx #0
-    ldy #0
-dsh_top:
-    lda ship_bitmap,x
-    sta (temp3),y
-    inx
-    iny
-    cpy #24
-    bne dsh_top
-
-    lda temp3
-    clc
-    adc #<320
-    sta temp3
-    lda temp3+1
-    adc #>320
-    sta temp3+1
-
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #24
-    sta sce_range_len
-    jsr star_evict_range
-
-    ldy #0
-dsh_bottom:
-    lda ship_bitmap,x
-    sta (temp3),y
-    inx
-    iny
-    cpy #24
-    bne dsh_bottom
-
-    lda #SHIP_MATRIX_BYTE
-    ldy #0
-    sta (temp4),y
-    ldy #1
-    sta (temp4),y
-    ldy #2
-    sta (temp4),y
-    ldy #40
-    sta (temp4),y
-    ldy #41
-    sta (temp4),y
-    ldy #42
-    sta (temp4),y
-
-    lda #SHIP_COLORRAM_BYTE
-    ldy #0
-    sta (temp2),y
-    ldy #1
-    sta (temp2),y
-    ldy #2
-    sta (temp2),y
-    ldy #40
-    sta (temp2),y
-    ldy #41
-    sta (temp2),y
-    ldy #42
-    sta (temp2),y
-    rts
-
-; erase_ship: per-cell guarded erase, same reasoning/structure as
-; erase_alien_x above (exclude_kind=0 - the ship itself - so
-; is_cell_covered checks aliens only, never the ship against itself;
-; exclude_idx is unused/irrelevant when exclude_kind=0).
 erase_ship_cells:
     lda ship_col
     jsr compute_ship_addrs
-
-    ; cell 0: top-left (ship_col+0, ship_row+0), temp3+0, y=0
-    lda ship_col
-    sta cell_check_col
-    lda ship_row
-    sta cell_check_row
+    lda temp3
+    sta esc_base_lo
+    lda temp3+1
+    sta esc_base_hi
     lda #0
-    sta cell_check_exclude_kind
-    jsr is_cell_covered
-    lda cell_check_result
-    bne esh_c0_skip
-    ldy #0
-esh_c0_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne esh_c0_erase
+    sta esc_cell
+esc_loop:
+    ldx esc_cell
+    ldy esc_moff,x
     lda #$73
-    ldy #0
     sta (temp4),y
     lda #4
-    ldy #0
     sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-esh_c0_skip:
-
-    ; cell 1: top-mid (ship_col+1, ship_row+0), temp3+8, y=1
-    lda temp3
+    lda esc_base_lo
     clc
-    adc #8
+    adc esc_boff_lo,x
     sta temp3
-    lda temp3+1
-    adc #0
+    lda esc_base_hi
+    adc esc_boff_hi,x
     sta temp3+1
-    lda ship_col
-    clc
-    adc #1
-    sta cell_check_col
-    lda ship_row
-    sta cell_check_row
+    ldy #7
     lda #0
-    sta cell_check_exclude_kind
-    jsr is_cell_covered
-    lda cell_check_result
-    bne esh_c1_skip
-    ldy #0
-esh_c1_erase:
-    lda #0
+esc_clear:
     sta (temp3),y
-    iny
-    cpy #8
-    bne esh_c1_erase
-    lda #$73
-    ldy #1
-    sta (temp4),y
-    lda #4
-    ldy #1
-    sta (temp2),y
+    dey
+    bpl esc_clear
     lda temp3
     sta sce_range_lo
     lda temp3+1
@@ -3819,175 +2804,10 @@ esh_c1_erase:
     lda #8
     sta sce_range_len
     jsr star_restore_range
-esh_c1_skip:
-
-    ; cell 2: top-right (ship_col+2, ship_row+0), temp3+16, y=2
-    lda temp3
-    clc
-    adc #8
-    sta temp3
-    lda temp3+1
-    adc #0
-    sta temp3+1
-    lda ship_col
-    clc
-    adc #2
-    sta cell_check_col
-    lda ship_row
-    sta cell_check_row
-    lda #0
-    sta cell_check_exclude_kind
-    jsr is_cell_covered
-    lda cell_check_result
-    bne esh_c2_skip
-    ldy #0
-esh_c2_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne esh_c2_erase
-    lda #$73
-    ldy #2
-    sta (temp4),y
-    lda #4
-    ldy #2
-    sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-esh_c2_skip:
-
-    ; cell 3: bottom-left (ship_col+0, ship_row+1), temp3+320, y=40
-    lda temp3
-    clc
-    adc #<304
-    sta temp3
-    lda temp3+1
-    adc #>304
-    sta temp3+1
-    lda ship_col
-    sta cell_check_col
-    lda ship_row
-    clc
-    adc #1
-    sta cell_check_row
-    lda #0
-    sta cell_check_exclude_kind
-    jsr is_cell_covered
-    lda cell_check_result
-    bne esh_c3_skip
-    ldy #0
-esh_c3_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne esh_c3_erase
-    lda #$73
-    ldy #40
-    sta (temp4),y
-    lda #4
-    ldy #40
-    sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-esh_c3_skip:
-
-    ; cell 4: bottom-mid (ship_col+1, ship_row+1), temp3+328, y=41
-    lda temp3
-    clc
-    adc #8
-    sta temp3
-    lda temp3+1
-    adc #0
-    sta temp3+1
-    lda ship_col
-    clc
-    adc #1
-    sta cell_check_col
-    lda ship_row
-    clc
-    adc #1
-    sta cell_check_row
-    lda #0
-    sta cell_check_exclude_kind
-    jsr is_cell_covered
-    lda cell_check_result
-    bne esh_c4_skip
-    ldy #0
-esh_c4_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne esh_c4_erase
-    lda #$73
-    ldy #41
-    sta (temp4),y
-    lda #4
-    ldy #41
-    sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-esh_c4_skip:
-
-    ; cell 5: bottom-right (ship_col+2, ship_row+1), temp3+336, y=42
-    lda temp3
-    clc
-    adc #8
-    sta temp3
-    lda temp3+1
-    adc #0
-    sta temp3+1
-    lda ship_col
-    clc
-    adc #2
-    sta cell_check_col
-    lda ship_row
-    clc
-    adc #1
-    sta cell_check_row
-    lda #0
-    sta cell_check_exclude_kind
-    jsr is_cell_covered
-    lda cell_check_result
-    bne esh_c5_skip
-    ldy #0
-esh_c5_erase:
-    lda #0
-    sta (temp3),y
-    iny
-    cpy #8
-    bne esh_c5_erase
-    lda #$73
-    ldy #42
-    sta (temp4),y
-    lda #4
-    ldy #42
-    sta (temp2),y
-    lda temp3
-    sta sce_range_lo
-    lda temp3+1
-    sta sce_range_hi
-    lda #8
-    sta sce_range_len
-    jsr star_restore_range
-esh_c5_skip:
+    inc esc_cell
+    lda esc_cell
+    cmp #6
+    bne esc_loop
     rts
 
 ; --- Ship death - ROUT2.asm's .crash: erase the ship, lose a life, kill
@@ -4012,13 +2832,20 @@ ship_explode_count:
 
 ship_crash:
     jsr ship_hide
+    lda #0                       ; ROUT4/INIT: the game is over when a ship is lost with no spare left
+    sta lives_out
+    lda lives_count
+    bne sc_spare
+    inc lives_out
+    jmp sc_lives_done
+sc_spare:
     dec lives_count
+sc_lives_done:
 
     ldx #0
 sc_clear_aliens:
     lda alien_active,x
     beq sc_ca_next
-    jsr erase_alien_x
     lda #0
     sta alien_active,x
     sta alien_exploding,x
@@ -4071,10 +2898,17 @@ sc_cab_next:
     cpx #ALIEN_BULLET_COUNT
     bne sc_clear_abullets
 
+    lda lives_out
+    bne sc_no_icon
     jsr redraw_lives_after_loss
-
-    lda #2                      ; tune 2 = Lost a Life
-    jsr start_tune
+sc_no_icon:
+    lda #SFX_CRASH
+    jsr sfx_play
+    lda demo_flag
+    bne sc_no_tune
+    lda #MUS_LOST
+    jsr music_start
+sc_no_tune:
 
     lda #0
     sta ship_explode_count
@@ -4114,21 +2948,38 @@ ship_explode_tick:
     inc ship_explode_timer
     rts
 she_finish:
+    lda demo_flag                ; ROUT4.asm's die_loop waits for the lost-life tune before going on
+    bne she_go
+    jsr music_busy
+    beq she_go
+    rts
+she_go:
     jsr erase_ship_cells
-    lda lives_count
-    beq she_over
+    jsr draw_level_flags         ; the burst may have been drawn over the flags/lives/KS rows at the bottom
+    jsr draw_lives_icons
+    jsr draw_ks_indicator
+    lda lives_out
+    bne she_over
     lda #SHIP_START_COL
     sta ship_col
-    lda #SHIP_START_ROW
+    jsr ship_home_row
     sta ship_row
     jsr draw_ship
     jsr init_alien_wave
     lda #GS_PLAYING
     sta game_state
+    lda lives_count              ; INIT.asm's next_life: the last spare ship has just been used
+    bne she_rts
+    lda #SFX_LSTMAN
+    jmp sfx_play
+she_rts:
     rts
 she_over:
-    lda #3                      ; tune 3 = Game Over
-    jsr start_tune
+    lda demo_flag
+    bne she_over_no_tune
+    lda #MUS_OVER
+    jsr music_start
+she_over_no_tune:
     lda #GS_GAME_OVER
     sta game_state
     rts
@@ -4199,6 +3050,8 @@ cbac_alien_loop:
     tax
     lda alien_score_table,x
     jsr add_score
+    lda #SFX_HIT
+    jsr sfx_play
     ldx cbac_saved_x
     jmp cbac_next_bullet
 
@@ -4221,6 +3074,12 @@ cbac_saved_y:
 ; hands off to ship_crash - stops scanning immediately after (ship_crash
 ; already cleared this whole pool anyway).
 check_alien_bullet_ship_collision:
+.ifdef CHEAT
+    lda cheat_god
+    beq :+
+    rts
+:
+.endif
     ldx #0
 cabs_loop:
     lda alien_bullet_active,x
@@ -4256,6 +3115,12 @@ cabs_next:
 ; (both the same size, so a plain absolute-difference test on each axis
 ; is enough - see the two negate-if-negative blocks below).
 check_alien_ship_collision:
+.ifdef CHEAT
+    lda cheat_god
+    beq :+
+    rts
+:
+.endif
     ldx #0
 cas_loop:
     lda alien_active,x
@@ -4383,14 +3248,36 @@ process_demo:
     lda demo_flag
     beq pd_done
     dec demo_count
-    bne pd_done
-    lda rand1+1
+    bpl pd_done                  ; (the original's BPL: the first call, from 255, picks at once)
+    jsr demo_rand                ; the original's rand1+1 barely changes between picks, so the ship kept drifting right
     sta demo_direction
+    jsr demo_rand
     and #15
     clc
     adc #10
     sta demo_count
 pd_done:
+    rts
+
+; demo_rand: a 16-bit LFSR run 8 steps per call, mixed with the raster line; the seed is never reset, so every
+; demo plays differently.
+demo_rng:
+ .word $ACE1
+demo_rand:
+    ldx #8
+dr_step:
+    asl demo_rng
+    rol demo_rng+1
+    bcc dr_next
+    lda demo_rng
+    eor #$2D
+    sta demo_rng
+dr_next:
+    dex
+    bne dr_step
+    lda demo_rng
+    eor demo_rng+1
+    eor $D012
     rts
 
 ; demo_fire_count/demo_process_fire: demo mode has no key to edge-detect
@@ -4414,455 +3301,6 @@ demo_process_fire:
     sta demo_fire_count
     jsr spawn_player_bullet
 dpf_done:
-    rts
-
-; --- Music: real BBC tune data (Martin Galway - also a well-known C64
-; SID composer), ported to actual SID playback. BBC call sites traced
-; directly: StartTune/Refresh/MusicTest (src/MUSIC1.asm), mksound (not
-; decoded this pass - see mk_sound below). The BBC engine is entirely
-; OS-mediated (OSWORD calls into a software envelope player); SID has no
-; such OS, so this is a real from-scratch 3-voice player, but the DATA
-; driving it - which notes, which tempo, which envelope shape - is the
-; real thing, not invented:
-;
-; - Note streams (c64_strt1-3/c64_zone1-3/c64_lost1-3/c64_over1-2, below)
-;   are byte-for-byte the same encoding BBC uses (bits 0-5 = pitch index
-;   0-62, 63=rest; bits 6-7 = a 2-bit "duration class" selecting one of
-;   4 tune-specific tempo values) - transcribed directly from
-;   src/MUSIC1-3.asm's EQUB data (Dn/Rest constants expanded via a
-;   script, not by hand, to avoid transcription slips), covering Game
-;   Start, Zone/wave, Lost a Life and Game Over (the 4 tunes reachable
-;   right now - Between Levels and the demo-section tunes are real data
-;   too, just not wired to a call site yet).
-; - Each tune's real tempo (music_spd), envelope choice (music_env) and
-;   note-duration (music_dur) were read off by tracing src/MUSIC1.asm's
-;   StartTune loop instruction-by-instruction against src/MUSIC3.asm's
-;   .LT table (which byte-offset window each tune's stored index
-;   actually selects), not assumed from the source's own comments -
-;   those turned out to disagree in places (e.g. "Game Over"'s speed
-;   index really selects the row commented "Game Start", and Zone reuses
-;   Lost-a-Life's tempo) - the code's actual behavior wins over the
-;   comment every time here.
-; - music_env_ad/music_env_sr map each of the 9 real envelope numbers
-;   (src's ENVELOPE statements, found in bas_extra/LOADER.bas.txt - a
-;   file not touched until this pass) to SID Attack/Decay/Sustain/
-;   Release nibbles: computed each envelope's real attack/decay/release
-;   time in milliseconds from its amplitude rate+target parameters
-;   (verified against BBC BASIC's own ENVELOPE parameter semantics),
-;   then picked the closest matching SID 6581 hardware rate (its own
-;   documented Attack/Decay-Release tables). This maps the AMPLITUDE
-;   side of each envelope only - all 9 also have a real, non-zero PITCH
-;   envelope (a pitch-bend component BBC's engine applies independently
-;   of the note's own pitch) that isn't implemented yet; every envelope
-;   here plays as a plain ADSR shape at the note's own fixed pitch.
-; - music_freq_lo/hi (pitch index 0-62 -> SID 16-bit frequency register)
-;   comes from BBC's own documented SOUND behavior (pitch 53 = middle C,
-;   4 units = 1 semitone; the game scales each note by 4 before it would
-;   reach SOUND, so a raw note index is directly a linear semitone
-;   count) combined with standard equal-temperament tuning and the
-;   standard SID PAL frequency-register formula - no BBC-specific
-;   guessing needed for this table, just verified formulas. Indices
-;   60-62 would overflow the 16-bit register and are clamped to $FFFF;
-;   none of the 4 ported tunes reach past note 52, so this never
-;   triggers yet.
-;
-; mk_sound (one-off effects - fire/explosion) is NOT decoded from real
-; data this pass (that's BOMBS1.asm/ROUT2.asm/ROUT3.asm's own mksound
-; call sites and effect tables - out of scope here, same as the BBC
-; explosion graphic was before it got a real decode) and is currently a
-; no-op, not an approximate blip - an earlier version played a fixed
-; blip on channel 2, but firing that on every shot retriggered channel
-; 2's envelope constantly, hijacking that channel's actual music part
-; and contributing real audible clicking - see mk_sound's own comment.
-
-MUSIC_CHANNELS = 3
-
-music_pat_lo:
- .res MUSIC_CHANNELS
-music_pat_hi:
- .res MUSIC_CHANNELS
-music_pat_off:
- .res MUSIC_CHANNELS
-music_cnt:
- .res MUSIC_CHANNELS
-music_env:
- .res MUSIC_CHANNELS
-music_dur:
- .res MUSIC_CHANNELS
-music_gate_cnt:
- .res MUSIC_CHANNELS
-music_stopped:
- .res MUSIC_CHANNELS
-music_spd:
- .res 4
-music_tune_off:
- .byte 0
-music_last_byte:
- .byte 0
-music_note_chan:
- .byte 0
-music_note_freq_lo:
- .byte 0
-music_note_freq_hi:
- .byte 0
-music_voice_lo:
- .byte 0
-music_voice_hi:
- .byte 0
-
-music_voice_base_lo:
- .byte <$D400,<$D407,<$D40E
-music_voice_base_hi:
- .byte >$D400,>$D407,>$D40E
-
-; music_env_ad/sr: envelope N is stored at index N-1 (envelopes are
-; numbered 1-9 in the source). hi nibble=Attack, lo nibble=Decay (AD);
-; hi nibble=Sustain level 0-15, lo nibble=Release (SR).
-music_env_ad:
- .byte $00,$18,$56,$99,$28,$00,$49,$38,$35
-music_env_sr:
- .byte $00,$21,$B9,$8A,$A9,$70,$58,$48,$B7
-
-; music_freq_lo/hi: pitch index 0-62 -> SID frequency register (PAL).
-; See the file header above for the derivation.
-music_freq_lo:
- .byte $18,$94,$16,$A0,$33,$CE,$73,$21,$DA,$9D,$6D,$48,$31,$27,$2C,$41
- .byte $66,$9D,$E6,$42,$B3,$3B,$D9,$90,$61,$4E,$59,$82,$CC,$39,$CB,$84
- .byte $67,$75,$B2,$20,$C3,$9D,$B1,$04,$98,$72,$96,$08,$CD,$EA,$64,$41
- .byte $86,$3A,$63,$08,$30,$E5,$2C,$11,$9B,$D5,$C9,$82,$FF,$FF,$FF
-music_freq_hi:
- .byte $08,$08,$09,$09,$0A,$0A,$0B,$0C,$0C,$0D,$0E,$0F,$10,$11,$12,$13
- .byte $14,$15,$16,$18,$19,$1B,$1C,$1E,$20,$22,$24,$26,$28,$2B,$2D,$30
- .byte $33,$36,$39,$3D,$40,$44,$48,$4D,$51,$56,$5B,$61,$66,$6C,$73,$7A
- .byte $81,$89,$91,$9A,$A3,$AC,$B7,$C2,$CD,$D9,$E6,$F4,$FF,$FF,$FF
-
-; music_tune_table: 4 tunes x 16 bytes (ch0 lo/hi, ch1 lo/hi, ch2 lo/hi,
-; spd[0-3], env[0-2], dur[0-2]) - see start_tune for the layout, and the
-; file header above for where each value came from.
-MUSIC_TUNE_STRIDE = 16
-music_tune_table:
-; tune 0: Game Start
- .word c64_strt1, c64_strt2, c64_strt3
- .byte 4,8,12,16
- .byte 6,6,6
- .byte 5,3,2
-; tune 1: Zone/wave
- .word c64_zone1, c64_zone2, c64_zone3
- .byte 5,10,15,20
- .byte 6,6,6
- .byte 5,3,2
-; tune 2: Lost a Life
- .word c64_lost1, c64_lost2, c64_lost3
- .byte 5,10,15,20
- .byte 5,6,7
- .byte 10,1,1
-; tune 3: Game Over
- .word c64_over1, c64_over2, c64_lost2
- .byte 4,8,12,16
- .byte 8,8,8
- .byte 5,3,2
-
-c64_strt1:
- .byte $88,$08,$48,$88,$08,$C8,$48,$48,$48,$48,$48,$8B
- .byte $0B,$4B,$8B,$0B,$CB,$4D,$4D,$4D,$4D,$4D,$08,$00
-c64_strt2:
- .byte $8B,$0B,$4B,$8B,$0B,$CB,$4B,$4B,$4B,$4B,$4B,$8F
- .byte $0F,$4F,$8F,$0F,$CF,$51,$51,$51,$51,$51,$0B,$00
-c64_strt3:
- .byte $8F,$0F,$4F,$8F,$0F,$CF,$4F,$4F,$4F,$4F,$4F,$92
- .byte $12,$52,$92,$12,$D2,$54,$54,$54,$54,$54,$0F,$00
-
-c64_zone1:
- .byte $48,$48,$14,$48,$08,$48,$48,$14,$48,$08,$4B,$4B
- .byte $12,$4B,$0B,$4B,$4B,$12,$4B,$0B,$4D,$4D,$14,$4D
- .byte $0D,$4D,$4D,$14,$4D,$0D,$50,$50,$14,$50,$10,$50
- .byte $50,$14,$50,$10,$00
-c64_zone2:
- .byte $03,$08,$0B,$0F,$14,$0F,$0B,$08,$03,$08,$0B,$0F
- .byte $14,$0F,$0B,$08,$03,$06,$0B,$0F,$12,$0F,$0B,$06
- .byte $03,$06,$0B,$0F,$12,$0F,$0B,$06,$04,$08,$0D,$10
- .byte $14,$10,$0D,$08,$04,$08,$0D,$10,$14,$10,$0D,$08
- .byte $04,$08,$0B,$10,$14,$10,$0B,$08,$04,$08,$0B,$10
- .byte $14,$10,$0B,$08,$3F,$00
-c64_zone3:
- .byte $60,$A0,$60,$1E,$60,$A0,$1B,$1E,$20,$63,$A3,$63
- .byte $1E,$63,$A3,$1E,$20,$23,$65,$A5,$65,$25,$65,$A5
- .byte $65,$24,$63,$A3,$63,$22,$63,$23,$22,$23,$25,$23
- .byte $22,$00
-
-c64_lost1:
- .byte $73,$74,$73,$71,$73,$71,$6F,$6E,$EC,$E7,$20,$00
-c64_lost2:
- .byte $33,$2F,$2C,$27,$2F,$2C,$27,$23,$2C,$27,$23,$20
- .byte $27,$23,$20,$1B,$23,$20,$1B,$17,$1B,$19,$17,$16
- .byte $14,$08,$08,$08,$08,$00
-c64_lost3:
- .byte $C8,$D4,$48,$48,$D4,$48,$48,$54,$48,$48,$00
-
-c64_over1:
- .byte $7F,$00
-c64_over2:
- .byte $7F,$00
-
-; start_tune: A = tune index (0-3). Resets all 3 channels to the start
-; of the chosen tune's note streams, loads its tempo/envelope/duration
-; values, silences all 3 SID voices, and sets a fixed pulse waveform
-; width + master volume (idempotent - harmless to redo on every call).
-start_tune:
-    asl a
-    asl a
-    asl a
-    asl a
-    sta music_tune_off
-
-    ldy music_tune_off
-    lda music_tune_table,y
-    sta music_pat_lo+0
-    iny
-    lda music_tune_table,y
-    sta music_pat_hi+0
-    iny
-    lda music_tune_table,y
-    sta music_pat_lo+1
-    iny
-    lda music_tune_table,y
-    sta music_pat_hi+1
-    iny
-    lda music_tune_table,y
-    sta music_pat_lo+2
-    iny
-    lda music_tune_table,y
-    sta music_pat_hi+2
-    iny
-    lda music_tune_table,y
-    sta music_spd+0
-    iny
-    lda music_tune_table,y
-    sta music_spd+1
-    iny
-    lda music_tune_table,y
-    sta music_spd+2
-    iny
-    lda music_tune_table,y
-    sta music_spd+3
-    iny
-    lda music_tune_table,y
-    sta music_env+0
-    iny
-    lda music_tune_table,y
-    sta music_env+1
-    iny
-    lda music_tune_table,y
-    sta music_env+2
-    iny
-    lda music_tune_table,y
-    sta music_dur+0
-    iny
-    lda music_tune_table,y
-    sta music_dur+1
-    iny
-    lda music_tune_table,y
-    sta music_dur+2
-
-    ldx #0
-stt_reset_loop:
-    lda #0
-    sta music_pat_off,x
-    sta music_stopped,x
-    sta music_gate_cnt,x
-    lda #1
-    sta music_cnt,x            ; forces an immediate note read on this
-                                 ; channel's first refresh_music tick
-    inx
-    cpx #MUSIC_CHANNELS
-    bne stt_reset_loop
-
-    lda #0
-    sta $D404
-    sta $D40B
-    sta $D412
-    lda #$08
-    sta $D402
-    sta $D409
-    sta $D410
-    lda #$0F
-    sta $D418
-    rts
-
-; refresh_music: called once per game_loop frame. Per channel: counts
-; down any note currently sounding to its release point (music_gate_cnt,
-; from the tune's own DURATAB-derived value), then counts down to the
-; next note read (music_cnt, from the tune's own tempo table via each
-; note's 2-bit duration class) - matches src/MUSIC1.asm's .Refresh
-; structure (two independent countdowns per channel, not one).
-refresh_music:
-    ldx #0
-rm_chan_loop:
-    lda music_stopped,x
-    bne rm_next_chan
-
-    lda music_gate_cnt,x
-    beq rm_check_note
-    dec music_gate_cnt,x
-    bne rm_check_note
-    jsr music_gate_off
-
-rm_check_note:
-    dec music_cnt,x
-    bne rm_next_chan
-
-    jsr music_read_note
-    lda music_stopped,x
-    bne rm_next_chan
-
-    lda music_last_byte
-    and #$3F
-    cmp #63
-    beq rm_reschedule           ; a rest - no sound, just reschedule below
-    jsr music_note_on
-
-rm_reschedule:
-    lda music_last_byte
-    rol a
-    rol a
-    rol a
-    and #3
-    tay
-    lda music_spd,y
-    sta music_cnt,x
-
-rm_next_chan:
-    inx
-    cpx #MUSIC_CHANNELS
-    bne rm_chan_loop
-    rts
-
-; music_read_note: X = channel. Reads the next byte from that channel's
-; note stream into music_last_byte and advances music_pat_off,X: a 0
-; byte means the stream has ended (matches the source - it just goes
-; silent and stays there, no auto-loop), setting music_stopped,X instead
-; of advancing further. Preserves X.
-music_read_note:
-    lda music_pat_lo,x
-    sta screen
-    lda music_pat_hi,x
-    sta screen+1
-    ldy music_pat_off,x
-    lda (screen),y
-    beq mrn_stop
-    sta music_last_byte
-    inc music_pat_off,x
-    rts
-mrn_stop:
-    lda #1
-    sta music_stopped,x
-    rts
-
-; music_note_on: X = channel, A = pitch index (0-62). Writes this
-; channel's SID voice frequency, ADSR (from its tune-assigned envelope),
-; and gates the note on; reloads music_gate_cnt,X from music_dur,X (the
-; tune's own fixed note-length). Preserves X (via music_note_chan).
-music_note_on:
-    stx music_note_chan
-    tay
-    lda music_freq_lo,y
-    sta music_note_freq_lo
-    lda music_freq_hi,y
-    sta music_note_freq_hi
-
-    ldx music_note_chan
-    lda music_voice_base_lo,x
-    sta music_voice_lo
-    sta screen
-    lda music_voice_base_hi,x
-    sta music_voice_hi
-    sta screen+1
-
-    ldy #0
-    lda music_note_freq_lo
-    sta (screen),y
-    ldy #1
-    lda music_note_freq_hi
-    sta (screen),y
-
-    ldx music_note_chan
-    lda music_env,x
-    sec
-    sbc #1
-    tay
-    lda music_env_ad,y
-    pha
-    lda music_env_sr,y
-    tax
-    ldy #5
-    pla
-    sta (screen),y
-    ldy #6
-    txa
-    sta (screen),y
-
-    ; Gate off THEN on, always - a note's own music_gate_cnt duration is
-    ; often shorter than the tune's tempo (the next note is frequently
-    ; due before the previous one's release finished), so the gate can
-    ; already be high when this runs. SID only restarts the attack phase
-    ; on a real 0->1 transition; writing $41 unconditionally when it was
-    ; already 1 is a no-op for the envelope (only the frequency would
-    ; actually change), which is most of what the reported "clicks and
-    ; pops" were - not a clean new note each time, just the previous
-    ; one's envelope carrying on under a jumped pitch.
-    ldy #4
-    lda #$40                    ; pulse waveform, gate off
-    sta (screen),y
-    lda #$41                    ; same waveform, gate on
-    sta (screen),y
-
-    ldx music_note_chan
-    lda music_dur,x
-    sta music_gate_cnt,x
-    rts
-
-; music_gate_off: X = channel. Clears the gate bit only (same waveform),
-; triggering the SID envelope's release phase. Preserves X.
-music_gate_off:
-    lda music_voice_base_lo,x
-    sta screen
-    lda music_voice_base_hi,x
-    sta screen+1
-    lda #$40
-    ldy #4
-    sta (screen),y
-    rts
-
-; mk_sound: NOT decoded from real BBC effect data this pass (see the
-; file header above) - a small fixed blip on channel 2, borrowing it
-; briefly from whatever music note is playing there, so bullet-fire has
-; some audible feedback. A is accepted but unused for now (reserved for
-; a future per-effect table).
-; mk_sound: back to a no-op for now. It was previously a fixed blip on
-; channel 2, but firing on every single shot (demo mode's auto-fire
-; alone is ~3/sec) meant it was retriggering channel 2's envelope that
-; often too, constantly hijacking that channel's actual music part -
-; a real, understood contributor to "clicks and pops" on top of the
-; gate-retrigger bug fixed above. Since it was never claiming to be
-; real decoded data anyway (see the file header), silence is more
-; honest than noise that fights the music - revisit once BOMBS1.asm's
-; real effect data gets the same treatment the tunes did.
-mk_sound:
-    rts
-
-; music_test: Z flag clear (BNE taken by caller) while any channel is
-; still playing; Z set once all 3 have hit their stream's end.
-music_test:
-    lda music_stopped+0
-    beq mt_playing
-    lda music_stopped+1
-    beq mt_playing
-    lda music_stopped+2
-    beq mt_playing
-    lda #0
-    rts
-mt_playing:
-    lda #1
     rts
 
 ; --- Level-number flags, bottom-left corner (rows 23-24) - NOT a lives
@@ -5268,6 +3706,26 @@ LIVES_RIGHT_COL = 38
 
 lives_count:
  .byte 3
+lives_out:                       ; set by ship_crash when the ship lost was the last one
+ .byte 0
+xlife_given:                     ; the 20000-point extra life has been awarded (ROUT3's extra_life_flag)
+ .byte 0
+
+; check_xlife: ROUT3.asm - an extra ship the first time the score reaches 20000. Called from the game loop, not from
+; add_score, so the lives icons are never redrawn from inside an alien's explosion.
+check_xlife:
+    lda xlife_given
+    bne cx_rts
+    lda score_digits+3
+    cmp #2
+    bcc cx_rts
+    inc xlife_given
+    inc lives_count
+    jsr draw_lives_icons
+    lda #SFX_XLIFE
+    jmp sfx_play
+cx_rts:
+    rts
 
 ; Tip-on-top, position confirmed correct, kept - just the tip's own 3
 ; rows internally reversed (the wide foot was at the very top with the
@@ -5682,6 +4140,14 @@ rs_clear:
     jmp print_bitmap_line
 
 draw_score_bar:
+    lda hs_score_digits+3        ; HI shows the top of the high-score table
+    sta str_hiscore
+    lda hs_score_digits+2
+    sta str_hiscore+1
+    lda hs_score_digits+1
+    sta str_hiscore+2
+    lda hs_score_digits
+    sta str_hiscore+3
     ldx #0
 dsb_loop:
     lda score_bar_table,x
@@ -6281,7 +4747,6 @@ hs_enter_name:
 
 hen_loop:
     jsr movestars
-    jsr refresh_music
     lda #250
 hen_wait_raster:
     cmp $D012
@@ -6743,7 +5208,7 @@ str_scr:
 str_hi:
     .byte 17,18,$FF                                 ; HI (CHARP.asm HItext)
 str_hiscore:
-    .byte 3,0,0,0,0,$FF                             ; "30000" (placeholder)
+    .byte 3,0,0,0,0,$FF                             ; the top high score, set by draw_score_bar (30000 at power-on)
 str_bykevin:
     .byte 11,34,38,20,14,31,18,23,38,14,13,32,10,27,13,28,$FF   ; BY KEVIN EDWARDS (CHARP.asm myname)
 str_press:

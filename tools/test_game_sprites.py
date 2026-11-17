@@ -11,6 +11,7 @@ within the few lines a crowded Y band may move it), that nothing else is shown, 
 re-programmed while its data is still being drawn. It cannot say anything about real VIC-II timing or looks.
 """
 import collections
+import hashlib
 import os
 import sys
 
@@ -21,20 +22,21 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 B = os.path.join(ROOT, "build")
 FRAMES = int(sys.argv[1]) if len(sys.argv) > 1 else 3000
 CPL = int(sys.argv[2]) if len(sys.argv) > 2 else 46
-LINES = 263
+LINES = int(os.environ.get("LINES", 263))      # LINES=312: a PAL machine (give 63 as cycles per line)
 
 lbl = {}
-for line in open(os.path.join(B, "GalaForce1-c64.lbl")):
+for line in open(os.path.join(B, "GalaForce1-c64%s.lbl" % os.environ.get("BUILD", ""))):
     _, a, n = line.split()
     lbl[n[1:]] = int(a, 16)
 
-prg = open(os.path.join(B, "GalaForce1-c64.PRG"), "rb").read()
+prg = open(os.path.join(B, "GalaForce1-c64%s.PRG" % os.environ.get("BUILD", "")), "rb").read()
 cpu = CPU()
 addr = prg[0] | prg[1] << 8
 cpu.m[addr:addr + len(prg) - 2] = prg[2:]
 cpu.pc, cpu.sp = 0x080D, 0xFF
 cpu.m[1] = 0x37
 
+JOY = [tuple(int(v) for v in k.split(':')) for k in os.environ.get('JOY', '').split(',') if k]
 PRESS = [tuple(int(v) for v in k.split(':')) for k in os.environ.get('PRESS', '').split(',') if k]   # PRESS=frame0:frame1:col:row,...
 state = dict(pending=False)
 sid = []              # (frame, register, value) writes to the SID
@@ -62,7 +64,12 @@ def rd(a):
                 v &= ~(1 << row)
         return v & 0xFF
     elif a == 0xDC00:
-        return 0xFF                         # no joystick
+        frame = cpu.cycles // (CPL * LINES)
+        v = 0xFF
+        for (f0, f1, bits) in JOY:           # JOY=f0:f1:mask,...: those joystick lines (port 2: 1 up 2 down 4 left 8 right 16 fire) pulled low
+            if f0 <= frame < f1:
+                v &= ~bits
+        return v & 0xFF
     elif a == 0xDC0D:
         return 0
     return raw_rd(a)
@@ -79,7 +86,7 @@ def pool():
         if m[lbl["alien_active"] + i]:
             out.append((m[lbl["alien_x"] + i], m[lbl["alien_y"] + i], m[lbl["alien_type"] + i],
                         m[lbl["alien_exploding"] + i], m[lbl["alien_explode_timer"] + i]))
-    return dict(swarm=m[lbl["swarm_flag"]], aliens=out, wave=m[lbl["c64_curwave"]], state=m[lbl["game_state"]],
+    return dict(swarm=0, aliens=out, wave=m[lbl["c64_curwave"]], state=m[lbl["game_state"]],
                 demo=m[lbl["demo_flag"]])
 
 
@@ -103,6 +110,13 @@ cpu.write_hooks.append(wr_hook)
 
 START_WAVE = os.environ.get("WAVE")      # WAVE=3: begin the game on that wave (3, 7 and 11 end in the swarm)
 started = False
+tune_done = False
+lives_done = False
+if os.environ.get("NOFIRE"):                 # NOFIRE=1: nobody shoots, so the swarm stays whole
+    cpu.m[lbl["spawn_player_bullet"]] = 0x60
+if os.environ.get("NOHIT"):                  # NOHIT=1: the ship cannot be hit (both collision routines return at once)
+    for _n in ("check_alien_ship_collision", "check_alien_bullet_ship_collision"):
+        cpu.m[lbl[_n]] = 0x60
 COUNT_AT = lbl.get(os.environ.get('COUNT'))      # COUNT=label: frames at which that label is reached
 hits = []
 import bisect
@@ -127,12 +141,40 @@ gl_hi = lbl["game_loop"] + 0x300
 def label_at(a):
     return label_names[bisect.bisect_right(label_addrs, a) - 1]
 awaiting = False
+dd_log = []
+HASH = os.environ.get('HASH')
+hash_next = 0
+hashes = []
+dumped = False
+life_log = []
 WATCH = {lbl[n]: n for n in ('title_wait_loop', 'show_high_scores', 'hs_loop', 'start_demo', 'game_loop', 'hs_enter_name', 'game_loop_escape', 'start_tune') if n in lbl}
 seen = {}
 frame_cycles = CPL * LINES
 irqs = 0
 last_line = -1
 while cpu.cycles < FRAMES * frame_cycles:
+    if HASH and cpu.pc == lbl["game_loop"] and cpu.cycles // frame_cycles >= hash_next:     # HASH=1: the screen at every 100th frame
+        hash_next = cpu.cycles // frame_cycles + 100
+        if os.environ.get("DUMP") and not dumped and hashes and hashes[-1][0] >= 0 and cpu.cycles // frame_cycles >= int(os.environ["DUMP"]):
+            dumped = True
+            open(os.environ["DUMPFILE"], "wb").write(bytes(cpu.m[0x4000:0x8000]))
+        hashes.append((cpu.cycles // frame_cycles, hashlib.md5(bytes(cpu.m[0x4000:0x8000])).hexdigest()[:8]))
+    if os.environ.get("LIFELOG") and cpu.pc == lbl["game_loop"]:      # LIFELOG=1: lives, extra-life flag and game-over flag whenever they change
+        st = (cpu.m[lbl["lives_count"]], cpu.m[lbl["xlife_given"]], cpu.m[lbl["lives_out"]])
+        if not life_log or life_log[-1][1] != st:
+            life_log.append((cpu.cycles // frame_cycles, st))
+    if os.environ.get("DEMODIR") and cpu.pc == lbl["game_loop"]:      # DEMODIR=1: ship column and demo direction at each pass
+        dd_log.append((cpu.m[lbl["ship_col"]], cpu.m[lbl["demo_direction"]] >> 7))
+    if os.environ.get("LIVES") and not lives_done and cpu.pc == lbl["game_loop"]:
+        lives_done = True                    # LIVES=n: start with n lives, so a game over is reached quickly
+        cpu.m[lbl["lives_count"]] = int(os.environ["LIVES"])
+    if os.environ.get("TUNE") is not None and not tune_done and cpu.pc == lbl["game_loop"]:
+        tune_done = True                     # TUNE=n: start music tune n at the first game loop pass (a marker goes in the SID log)
+        sid.append((cpu.cycles // frame_cycles, 0xFF, int(os.environ["TUNE"])))
+        cpu.push((lbl["game_loop"] - 1) >> 8)
+        cpu.push((lbl["game_loop"] - 1) & 255)
+        cpu.a = int(os.environ["TUNE"])
+        cpu.pc = lbl["music_start"]
     if START_WAVE is not None and not started and cpu.pc == lbl["game_loop"]:
         started = True                       # the game has just started: switch to the wave asked for
         cpu.m[lbl["c64_curwave"]] = int(START_WAVE)
@@ -196,6 +238,18 @@ while cpu.cycles < FRAMES * frame_cycles:
 
 print(f"ran {cpu.cycles // frame_cycles} frames at {CPL} cycles/line, {irqs} IRQs, {len(snaps)} sprite lists built, "
       f"{len(events)} VIC writes; pc=${cpu.pc:04X}")
+if os.environ.get("PEEK"):                      # PEEK=label,label: the value of those exported variables at the end
+    print("peek:", {n: cpu.m[lbl[n]] for n in os.environ["PEEK"].split(",")})
+if HASH:
+    print("screen hashes:", " ".join("%d:%s" % h for h in hashes))
+if os.environ.get("LIFELOG"):
+    print("lives (count, extra life given, out):", life_log)
+if os.environ.get("DEMODIR"):
+    print("\n".join("%d:%d" % x for x in dd_log[1000:1160]).replace("\n", " "))
+    print("demo: passes going left %d, right %d; ship column histogram (tens): %s" % (sum(d for c, d in dd_log), sum(1 - d for c, d in dd_log), sorted(collections.Counter(c // 5 * 5 for c, d in dd_log).items())))
+if os.environ.get("SIDLOG"):                   # SIDLOG=file.json: every SID register write as (frame, register, value)
+    import json
+    json.dump(sid, open(os.environ["SIDLOG"], "w"))
 if os.environ.get("EXTENT"):                   # EXTENT=1: where text is on the multicolour bitmap at the end of the run
     def pix(cx, cy, line):
         b = cpu.m[0x6000 + (cy * 40 + cx) * 8 + line]
@@ -222,13 +276,22 @@ if PROF and passes:
 if PROF:
     tot = sum(PROF.values())
     print("cycles by label (nearest preceding), total %d:" % tot)
-    for n, c in PROF.most_common(25):
+    for n, c in PROF.most_common(int(os.environ.get("TOP", 25))):
         print("  %-28s %5.1f%%" % (n, 100 * c / tot))
 if os.environ.get("PACE"):                    # PACE=1: how many frames each game loop pass took
     d = [round((b - a) / frame_cycles, 2) for a, b in zip(builds, builds[1:])]
     h = collections.Counter(min(int(x + 0.5), 6) for x in d)
     print("frames per game loop pass (rounded) -> passes:", dict(sorted(h.items())))
     print("first 60 passes:", d[:60])
+    swb = [b for b, sn in zip(builds, snaps) if sn["swarm"]]
+    if swb and COUNT_AT is not None:
+        f0, f1 = swb[0] // frame_cycles, swb[-1] // frame_cycles
+        n_ = sum(1 for h in hits if f0 <= h <= f1)
+        alive = sum(sum(1 for a in sn["aliens"] if not a[3]) for sn in snaps if sn["swarm"])
+        print("during the swarm (frames %d-%d): %s reached %d times = %.2f per frame, %.3f per alien per pass" % (f0, f1, os.environ["COUNT"], n_, n_ / max(f1 - f0, 1), n_ / max(alive, 1)))
+    sw = [x for x, sn in zip(d, snaps[1:]) if sn["swarm"]]
+    if sw:
+        print("passes during a swarm: %d, frames per pass: mean %.2f, max %.1f, histogram %s" % (len(sw), sum(sw) / len(sw), max(sw), dict(sorted(collections.Counter(min(int(x + 0.5), 9) for x in sw).items()))))
 if os.environ.get("TRACEOUT"):                # TRACEOUT=file.json: the alien pool at every game loop pass
     import json
     json.dump(snaps, open(os.environ["TRACEOUT"], "w"))
@@ -261,8 +324,10 @@ for L in range(int(cpu.cycles // CPL)):
         x = reg[0xD000 + 2 * s] | (((reg[0xD010] >> s) & 1) << 8)
         ptr, col = reg[0x43F8 + s], reg[0xD027 + s]
         if active[s]:
-            if 21 - active[s] <= 16 and (x, ptr, col) != snap[s]:
+            if 21 - active[s] < 16 and (x, ptr, col) != snap[s]:
                 corrupt.append((mi, s, lf))
+                if os.environ.get("CORRUPT") and len(corrupt) == 1:
+                    print("   first corrupt: sprite", s, "line", lf, "now", (x, hex(ptr), col), "at display start", (snap[s][0], hex(snap[s][1]), snap[s][2]), "regY", reg[0xD001 + 2 * s], "active", active[s])
             active[s] -= 1
         elif (reg[0xD015] >> s) & 1 and reg[0xD001 + 2 * s] == lf and lf < 256:
             snap[s] = (x, ptr, col)
@@ -282,7 +347,7 @@ if os.environ.get("SHIPLOG"):                  # SHIPLOG=1: sprite 7 (the ship) 
             x7 = r7[0xD00E] | (r7[0xD010] >> 7) << 8
             print("  frame %4d ship sprite %s at x=%3d y=%3d (col %.1f row %.1f) ptr %02X col %X" % (L // LINES, "on " if on else "off", x7, r7[0xD00F], (x7 - 24) / 8, (r7[0xD00F] - 50) / 8, r7[0x43FF], r7[0xD02E]))
 # ---- expected, through an independent copy of the transform --------------------------------------------------
-ymap = [round(y * 200 / 256) for y in range(256)]
+ymap = [int(v) for v in open(os.path.join(ROOT, "src-c64", "gen", "tables.inc")).read().split("spr_ymap:")[1].split("spr_gra2shape:")[0].replace(".byte", ",").replace("\n", "").split(",") if v.strip()]
 own = None
 for l in open(os.path.join(ROOT, "src-c64", "gen", "tables.inc")):
     pass
@@ -296,7 +361,7 @@ def expected(s):
     out = []
     for x, y, typ, expl, timer in s["aliens"]:
         line = ymap[y]
-        if line < 8 or line > 168:
+        if line < 8 or line > 199:
             continue
         shape = 12 + min(timer, 5) if expl else typ
         out.append((24 + 2 * x, 50 + line, 0x10 + shape, own[shape]))

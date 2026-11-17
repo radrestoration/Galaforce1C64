@@ -23,8 +23,8 @@
 ;; tables beside them and its variables in SPRVAR (galaforce1-c64.cfg). The shared colours, shapes and tables are generated into gen/
 ;; by tools/make_sprtest.py.
 ;;
-;; The swarm waves (spawn group 45: 32 aliens in 4 rows 19 lines apart) do not fit a multiplexer; they keep
-;; the old bitmap drawing, selected by swarm_flag (INIT.asm), and spr_build then shows no aliens.
+;; The swarm waves (spawn group 45: 32 aliens in 4 rows 19 lines apart) are more than seven sprites can show at once:
+;; the aliens a row has too many of are moved down a few lines, or dropped, by spr_build.
 
 .reloc
 .segment "SPRTAB"
@@ -35,14 +35,17 @@
 
 SPR_PTRS      = $43F8
 SPR_N         = 7            ; sprites used for aliens (0-6); sprite 7 is the player's ship
-SPR_MAXRAW    = 16           ; objects per frame (the largest normal wave has 10 aliens)
+SPR_MAXRAW    = 36           ; objects per frame (the swarm waves have 32 aliens)
+SPR_BUF       = SPR_MAXRAW   ; size of one of the two list buffers
 SPR_TOP_LINE  = 30
+SPR_MUSIC_LINE = 8           ; the music engine's interrupt: after the last sprite of a frame, before the next top
 SPR_HC        = 3            ; lines one handler run is assumed to take
 SPR_DONE      = 17           ; first line after a sprite's 16 lines of data
 SPR_DMA_END   = 22           ; first line a sprite's Y may match again (its DMA runs 21 lines)
 SPR_YOFF      = 50           ; sprite Y of the first screen line
 SPR_MINLINE   = 8            ; objects above this screen line would cover the score bar
-SPR_MAXLINE   = 168          ; objects below this would cover the flags/lives rows (184 - 16)
+SPR_MAXLINE   = 199          ; last screen line an alien can start on: sprites are in front of the bitmap and do not
+                             ; damage the flags/lives rows, and the ship can now reach them
 SPR_YMAX      = SPR_YOFF + SPR_MAXLINE
 
 .segment "ZP2": zeropage
@@ -73,12 +76,12 @@ sz_ship_on: .res 1           ; $80 while the ship sprite is shown, else 0
 sz_ship_x:  .res 1
 sz_ship_xh: .res 1           ; $80 if the ship's hardware X has its 9th bit
 sz_ship_y:  .res 1
-so_ysp:    .res 32
-so_x:      .res 32
-so_xhi:    .res 32
-so_ptr:    .res 32
-so_col:    .res 32
-so_irq:    .res 32
+so_ysp:    .res 2*SPR_BUF
+so_x:      .res 2*SPR_BUF
+so_xhi:    .res 2*SPR_BUF
+so_ptr:    .res 2*SPR_BUF
+so_col:    .res 2*SPR_BUF
+so_irq:    .res 2*SPR_BUF
 sr_y:      .res SPR_MAXRAW
 sr_xlo:    .res SPR_MAXRAW
 sr_xhi:    .res SPR_MAXRAW
@@ -125,6 +128,7 @@ spr_init:
     lda spr_own_col,y
     sta $D02E
     jsr spr_reset
+    jsr music_init
     lda #SPR_TOP_LINE
     sta $D012
     lda #1
@@ -194,10 +198,7 @@ spr_build:
     lda #0
     sta sz_back_ready       ; the buffer being written is no longer ready: a swap now must keep the front one
     sta sz_rn
-    lda swarm_flag
-    beq :+
-    jmp sb_empty            ; the swarm is drawn in the bitmap
-:   ldx #0
+    ldx #0
 sb_loop:
     cpx alien_pool_max
     bcs sb_sort
@@ -255,7 +256,6 @@ sb_shape:
 sb_next:
     inx
     jmp sb_loop
-sb_empty:
 sb_sort:
     lda sz_rn
     sta sz_ncount
@@ -303,7 +303,7 @@ sb_sdone:
 
     ; final Y (moved down where the sprite or the handler would not be ready), in rank order, into the back buffer
     lda sz_front
-    eor #16
+    eor #SPR_BUF
     sta sz_bbase
     lda #0
     sta sz_oc
@@ -414,13 +414,24 @@ spr_irq:
     lda #1
     sta $D019
     lda sz_phase
-    bne si_chain
+    beq si_top
+    cmp #2
+    bne si_chainj
+    jsr music_frame         ; phase 2: the music, once a frame
+    lda #0
+    sta sz_phase
+    lda #SPR_TOP_LINE
+    sta $D012
+    jmp si_out
+si_chainj:
+    jmp si_chain
 
+si_top:
     ; top of frame
     lda sz_back_ready
     beq si_nosw
     lda sz_front
-    eor #16
+    eor #SPR_BUF
     sta sz_front
     lda sz_bcount
     sta sz_fcount
@@ -463,7 +474,13 @@ si_pt:
 si_ptdone:
     lda sz_fcount
     cmp #SPR_N+1
-    bcc si_out              ; nothing more to multiplex: the next IRQ is the next top of frame
+    bcs si_more
+    lda #2                  ; nothing more to multiplex: the next IRQ is the music's, then the next top of frame
+    sta sz_phase
+    lda #SPR_MUSIC_LINE
+    sta $D012
+    jmp si_out
+si_more:
     lda #0
     sta sz_sp
     lda #SPR_N
@@ -507,9 +524,9 @@ si_cl:
     sta $D012
     jmp si_out
 si_cdone:
-    lda #0
+    lda #2
     sta sz_phase
-    lda #SPR_TOP_LINE
+    lda #SPR_MUSIC_LINE
     sta $D012
 si_out:
     pla

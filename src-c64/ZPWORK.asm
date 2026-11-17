@@ -43,17 +43,8 @@ temp4:
 
 rand1:
   .res 3
-counter:
-  .byte 0
 
-; dab_ptr: draw_alien_bitmap_generic's source-bitmap pointer - needs to
-; be zero page for (dab_ptr),y indirect addressing (temp2/3/4 are all
-; simultaneously busy holding this same draw's color-RAM/bitmap/screen-
-; matrix addresses, so none of them are free to double up here).
-dab_ptr:
-  .word 0
-
-; dof_ptr: same reasoning as dab_ptr, for draw_flag_generic's source-
+; dof_ptr: needs to be zero page for (dof_ptr),y indirect addressing (temp2/3/4 are busy), for draw_flag_generic's source-
 ; bitmap pointer (the level-number flag icons).
 dof_ptr:
   .word 0

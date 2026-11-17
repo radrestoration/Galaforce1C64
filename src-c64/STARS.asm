@@ -210,6 +210,8 @@ irp_yes:
 star_init:
  LDX  #0
 si_loop:
+ LDA  #0
+ STA  star_hidden,x      ; new stars start visible (a stale flag would freeze one invisible)
 si_row:
  JSR  star_rand_mask
  AND  #31                ; mask must cover the full BAND_ROWS range (now
@@ -414,8 +416,7 @@ ms_recolor_flag:
  .byte 0
 
 ; --- Per-cell ownership: star_evict_range/star_restore_range let a hard
-; object (ship/alien - see INIT.asm's draw_alien_bitmap_0/1/2, draw_ship,
-; draw_explosion_here, erase_alien_x, erase_ship) claim or release a byte
+; object (the ship's burst - see INIT.asm's draw_explosion_here, erase_ship_cells) claim or release a byte
 ; range of the bitmap without permanently desyncing any star's XOR parity
 ; - the root cause of the "stuck star" bug (an object's overwrite-style
 ; draw/erase used to clobber a star's cell with no way for the star to
@@ -428,7 +429,7 @@ ms_recolor_flag:
 ; indexing bug that caused a real crash earlier this session) - nonzero
 ; means this star is currently covered and frozen; movestars (above)
 ; skips a hidden star entirely; both routines below fully preserve X, Y
-; AND temp3/temp3+1 - draw_alien_bitmap_0/1/2 etc. rely on temp3 still
+; AND temp3/temp3+1 - draw_explosion_here etc. rely on temp3 still
 ; holding the cell-band base address the instant one of these calls
 ; returns, so treating them as a black box that disturbs nothing but
 ; star_hidden/the actual star pixels removes the need for every one of
@@ -555,3 +556,4 @@ srr_next:
  RTS
 srr_diff_lo:
  .byte 0
+
