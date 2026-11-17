@@ -9,6 +9,7 @@ The BBC source is in `src/` (beebasm syntax, unmodified, reference only). This i
     make                           # build/GalaForce1-c64.PRG (+ .list, map.txt)
     make run                       # build and run in VICE (x64sc)
     make d64                       # build/galaforce1.d64: the loading screens, then the game (LOAD"*",8,1)
+    make zip                       # build/Galaforce1-C64.zip: the release (disk image, game PRG, README)
     make clean
 
 Needs cc65 (`cl65`) and python3.
@@ -75,7 +76,6 @@ a crowded row are moved down a few lines or dropped. Bullets, stars, the ship's 
 multiplexer test (`make run-sprtest`).
 Memory: code and data end below $4000; sprite shapes, tables and the star arrays are in the free part of VIC bank 1.
 
-
 Everything is drawn into the VIC-II multicolour bitmap (VIC bank 1: screen matrix `$4000`, bitmap `$6000`),
 160 x 200 colour pixels, which matches the BBC's MODE 2 pixel grid horizontally. The BBC screen is 256 lines
 high, so the vertical layout has to be squeezed to 200.
@@ -84,15 +84,16 @@ high, so the vertical layout has to be squeezed to 200.
 
 The game logic is a reimplementation that follows the BBC source (alien types, spawn waves, flight patterns,
 scoring, lives, high scores), not a line-by-line translation; comments in `INIT.asm` cite the BBC routines.
+
 ## Music and sound
 
 The notes, tempo and rhythm of every tune are the original's: `tools/make_music.py` reads `MUSIC1-3.asm` and writes
-`src-c64/gen/music.inc`. The sounds are SID patches made for this port (four instruments, three effects), not an
+`src-c64/gen/music.inc`. The sounds are SID patches made for this port (four instruments, five effects), not an
 emulation of the BBC's `ENVELOPE`s. The engine ticks 50 times a second, as the original's vertical-sync event does
 (every frame on PAL, 5 in 6 on NTSC), independent of the game loop. Tunes: game start, between levels (the zone tune
 every 16th wave), lost a life (the ship's respawn waits for it), game over (the high-score screen waits for it) and the
 demo's four sections. The title and high-score screens have no music, as in the original. Effects (fire, alien
-explosion, ship crash) take over SID voice 3 briefly. `make test-music` checks every tune against the original's note
+explosion, ship crash, extra life, last man) take over SID voice 3 briefly. `make test-music` checks every tune against the original's note
 data (pitch, start time, gate length), headless; `PAL=1 make test-music` does it for PAL.
 
 The extra life (the first time the score reaches 20000) and the "last man" sound (when the last spare ship goes into

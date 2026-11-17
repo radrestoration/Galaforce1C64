@@ -18,7 +18,7 @@ B    := build
 PRG  := $(B)/GalaForce1-c64.PRG
 SRCS := Master-c64.mak.asm $(wildcard src-c64/*.asm src-c64/*.inc src-c64/gen/*) object/O.SPFONT_C64
 
-.PHONY: all run help clean intro run-intro test-intro trace sprtest test-sprtest run-sprtest test-game test-music sprdata musicdata d64 test-build run-test
+.PHONY: all run help clean intro run-intro test-intro zip trace sprtest test-sprtest run-sprtest test-game test-music sprdata musicdata d64 test-build run-test
 all: $(PRG)
 
 help:
@@ -35,6 +35,7 @@ help:
 	@echo "make d64    build/galaforce1.d64: the loading screens (first file: LOAD\"*\",8,1) and the game on a disk image"
 	@echo "make intro  build/intro.prg: the loading screens alone, made from disc/Disc025-Galaforce.ssd (run-intro runs the d64 in VICE, test-intro checks it headless)"
 	@echo "make test-build  build/GalaForce1-c64-TEST.PRG with cheat keys: 1 next wave, 2 extra ship, 3 invulnerable, 4 +10000 (run-test runs it)"
+	@echo "make zip    build/Galaforce1-C64.zip: the release (galaforce1.d64, the game PRG without loading screens, README.md)"
 	@echo "make clean  remove build/"
 
 $(PRG): $(SRCS) galaforce1-c64.cfg | $(B)
@@ -100,6 +101,19 @@ d64: $(PRG) $(INTRO)
 	rm -f $(B)/galaforce1.d64
 	c1541 -format "galaforce 1,gf" d64 $(B)/galaforce1.d64 -write $(INTRO) galaforce -write $(PRG) game >/dev/null
 	@echo "$(B)/galaforce1.d64: LOAD\"*\",8,1 then RUN (the loading screens, then the game)"
+
+# the release: the disk image (loading screens, then the game), the game alone, the README. No cheat keys in either.
+ZIP := $(B)/Galaforce1-C64.zip
+zip: $(ZIP)
+$(ZIP): d64 $(PRG) README.md
+	rm -f $@
+	rm -rf $(B)/zip && mkdir -p $(B)/zip
+	cp $(B)/galaforce1.d64 $(B)/zip/Galaforce1-C64.d64
+	cp $(PRG) $(B)/zip/Galaforce1-C64-game-only.prg
+	cp README.md $(B)/zip/
+	cd $(B)/zip && zip -q ../Galaforce1-C64.zip *
+	rm -rf $(B)/zip
+	@unzip -l $@
 
 test-intro: $(INTRO)
 	$(PYTHON) -I tools/test_intro.py
