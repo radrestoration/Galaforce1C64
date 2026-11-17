@@ -47,7 +47,7 @@
 ; labels the headless tests read (tools/test_game_sprites.py, through the label file `make` writes)
 .export title_wait_loop, show_high_scores, hs_loop, start_demo, hs_enter_name, game_loop_escape, music_start, music_frame, music_busy, music_stop, sfx_play
 .export score_digits, hs_score_digits
-.export demo_direction, ship_col, lives_count, xlife_given, lives_out, afb_spawn, abh_go, joy_flag, sound_off
+.export demo_direction, ship_col, lives_count, xlife_given, lives_out, afb_spawn, abh_go, sound_off
 .export alien_apply_move, ard_redraw
 .export spawn_player_bullet, init_alien_hp, check_alien_ship_collision, check_alien_bullet_ship_collision
 .export exec, game_loop, init_alien_wave, wave_off, spr_build, alien_pool_max, alien_active, alien_x, alien_y

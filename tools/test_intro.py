@@ -3,7 +3,10 @@ model, SPACE is pressed for each page, and every page and the picture are drawn 
 them: the screen, colour RAM and the character set the program built, or the bitmap). Checks the picture against the disc's,
 that RUN/STOP skips the pages, and that the loader asks for the file GAME from device 8 and jumps to $080D.
 
-    tools/test_intro.py [skip]       skip: press RUN/STOP at the first page
+    tools/test_intro.py [skip|pickey]   skip: press RUN/STOP at the first page; pickey: press a key 30 frames into the picture
+    NTSC=1 tools/test_intro.py          a 262-line machine (the picture waits 300 frames instead of 250)
+
+The picture must stay up for 5 seconds (250 PAL frames, 300 NTSC) unless a key is pressed.
 """
 import os
 import sys
@@ -19,7 +22,10 @@ OUT = os.path.join(B, "intro_test")
 os.makedirs(OUT, exist_ok=True)
 CHARGEN = "/usr/share/vice/C64/chargen-901225-01.bin"
 SKIP = len(sys.argv) > 1 and sys.argv[1] == "skip"
-CPL, LINES = 63, 312
+PICKEY = len(sys.argv) > 1 and sys.argv[1] == "pickey"
+NTSC = bool(os.environ.get("NTSC"))
+CPL, LINES = (65, 263) if NTSC else (63, 312)
+pic_t = None                                          # the frame the picture wait began
 
 lbl = {}
 for line in open(os.path.join(B, "intro.lbl")):
@@ -50,6 +56,8 @@ def rd(a):
         return (cpu.m[0xD011] & 0x7F) | (((cpu.cycles // CPL) % LINES >> 8) << 7)
     if a == 0xDC01:
         v = 0xFF
+        if pic_t is not None:                            # in the picture wait: no key, or (pickey) SPACE 30 frames in
+            return 0xEF if PICKEY and frame() >= pic_t + 30 and not cpu.m[0xDC00] & 0x80 else 0xFF
         # SPACE (column 7, row 4) for 3 frames in every 40 once released; RUN/STOP (column 7, row 7) in the skip test
         if not cpu.m[0xDC00] & 0x80 and frame() % 40 < 3 and frame() > 5:
             v &= ~(0x80 if SKIP else 0x10)
@@ -101,6 +109,8 @@ while steps < 60_000_000 and not done:
         text_png(page)
         shown.append(bytes(cpu.m[0x0400:0x0400 + 1000]))
         page += 1
+    if pc == lbl["wait_picture"] and pic_t is None:
+        pic_t = frame()
     if pc == 0x0335:                                    # the relocated loader: the picture is complete
         picture_png()
         files = {}
@@ -129,5 +139,8 @@ print("picture equals the disc's:", files["bitmap"] == ref)
 print("loader: file %r, SETLFS %s, entered the game at $%04X" % (name, files["lfs"], cpu.pc))
 ok = files["bitmap"] == ref and name == b"GAME" and files["lfs"] == (1, 8, 1) and cpu.pc == 0x080D
 ok = ok and page == (1 if SKIP else 6)
+waited = frame() - pic_t
+print("picture waited %d frames" % waited)
+ok = ok and (28 <= waited <= 36 if PICKEY else abs(waited - (300 if NTSC else 250)) <= 2)
 print("ok" if ok else "FAILED")
 sys.exit(0 if ok else 1)

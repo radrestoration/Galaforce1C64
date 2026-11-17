@@ -118,6 +118,8 @@ $(ZIP): d64 $(PRG) README.md
 test-intro: $(INTRO)
 	$(PYTHON) -I tools/test_intro.py
 	$(PYTHON) -I tools/test_intro.py skip
+	$(PYTHON) -I tools/test_intro.py pickey
+	NTSC=1 $(PYTHON) -I tools/test_intro.py
 
 run-intro: d64
 	$(X64SC) $(if $(MODEL),-model $(MODEL)) -VICIIfilter 0 -autostartprgmode 1 -virtualdev8 +drive8truedrive +autostart-handle-tde -8 $(B)/galaforce1.d64 $(INTRO)

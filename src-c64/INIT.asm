@@ -70,8 +70,8 @@ exec:
     lda $D016
     ora #$10             ; MCM on
     sta $D016
-    lda #$01
-    sta $D020            ; border white - shows the visible-area edges
+    lda #$00
+    sta $D020            ; border black
     lda #$00
     sta $D021             ; background black
 
@@ -133,7 +133,7 @@ show_high_scores:
     jsr clear_screen
     jsr draw_high_score_table
     jsr draw_score_bar
-    jsr draw_ks_indicator
+    jsr draw_sound_indicator
     jsr draw_level_flags
     jsr draw_lives_icons
     jsr star_init
@@ -183,6 +183,21 @@ game_start:
     jsr clear_screen
     jsr star_init
 
+    ; clear_screen wiped the bitmap, but a bullet or bomb still in flight (the demo ended mid-shot) is still marked
+    ; active and would carry on into the new game, a stray shot on the blank screen
+    lda #0
+    ldx #BULLET_COUNT-1
+gs_clr_bullets:
+    sta bullet_active,x
+    dex
+    bpl gs_clr_bullets
+    ldx #ALIEN_BULLET_COUNT-1
+gs_clr_abullets:
+    sta alien_bullet_active,x
+    dex
+    bpl gs_clr_abullets
+    sta alien_bullet_live_count
+
     lda #3
     sta lives_count
     lda #1
@@ -201,7 +216,7 @@ game_start:
     sta score_glyphs+3
 
     jsr draw_score_bar
-    jsr draw_ks_indicator
+    jsr draw_sound_indicator
     jsr draw_level_flags
     jsr draw_lives_icons
     jsr init_alien_wave
@@ -278,7 +293,7 @@ gl_pause_checked:
     jmp game_loop
 gl_not_paused:
 
-    jsr check_ks_keys
+    jsr check_sound_key
 .ifdef CHEAT
     jsr check_cheats
 .endif
@@ -435,7 +450,7 @@ check_pause_key:
 
 ; handle_ship_input: polls Z/X (left/right), ";" or "=" (up) and "/" (down) via the CIA1 keyboard matrix ($DC00
 ; selects a column by clearing its bit; $DC01 then reads that column's row switches, 0 = pressed), or the joystick
-; in port 2 when the K key has switched to it, and moves the ship one cell per call, throttled to every
+; in port 2 (both are read), and moves the ship one cell per call, throttled to every
 ; SHIP_MOVE_SLOWDOWN'th call. The ship is a sprite, so a move is just a new position (draw_ship).
 ;
 ; "Up" is ";" (the physically right key on a C64 keyboard) or "=" (where VICE's default keymap lands a host
@@ -461,10 +476,8 @@ hsi_slowdown_ok:
     beq hsi_not_demo
     jmp hsi_demo_move
 hsi_not_demo:
-    lda joy_flag
-    beq hsi_keys
-    jmp hsi_joystick
-hsi_keys:
+    jsr hsi_joystick        ; the joystick and the keys both work (the original's K switch is not needed: the C64's
+                            ; joystick is digital and does not drift)
 
     lda #$FD               ; clear bit1: select column 1 (Z's column)
     sta $DC00
@@ -598,7 +611,7 @@ hj_down:
     inc ship_row
 hj_done:
     jsr draw_ship
-    jmp hsi_done
+    rts
 
 ; read_joystick: A = the port 2 joystick, bit 0 up, 1 down, 2 left, 3 right, 4 fire, 0 = pressed. (Setting the keyboard
 ; column lines high first stops the keyboard matrix reaching the port.)
@@ -608,11 +621,7 @@ read_joystick:
     lda $DC00
     rts
 
-joy_flag:                       ; 1 = joystick (the K key), 0 = keyboard
- .byte 0
 joy_bits:
- .byte 0
-ks_prev_k:
  .byte 0
 ks_prev_s:
  .byte 0
@@ -699,28 +708,11 @@ cc_rts:
     rts
 .endif
 
-; check_ks_keys: ROUT1.asm's sound_on_off/key_joy: K switches between keyboard and joystick, S the sound on and off.
-; The letter in the corner of the screen shows the state (K or J, S or Q). A key counts once per press.
-check_ks_keys:
+; check_sound_key: ROUT1.asm's sound_on_off: S switches the sound on and off. The letter in the corner of the screen shows
+; the state (S or Q). A key counts once per press. (The original's K, keyboard or joystick, is gone: both are read.)
+check_sound_key:
     lda #0
     sta cks_changed
-    lda #$EF                 ; column 4: K is row bit 5
-    sta $DC00
-    lda $DC01
-    and #$20
-    bne cks_k_up
-    lda ks_prev_k
-    bne cks_s
-    lda #1
-    sta ks_prev_k
-    lda joy_flag
-    eor #1
-    sta joy_flag
-    inc cks_changed
-    jmp cks_s
-cks_k_up:
-    lda #0
-    sta ks_prev_k
 cks_s:
     lda #$FD                 ; column 1: S is row bit 5
     sta $DC00
@@ -740,25 +732,19 @@ cks_s_up:
 cks_done:
     lda cks_changed
     beq cks_rts
-    lda #20                  ; K
-    ldx joy_flag
-    beq cks_k_glyph
-    lda #19                  ; J
-cks_k_glyph:
-    sta str_k
     lda #28                  ; S
     ldx sound_off
     beq cks_s_glyph
     lda #26                  ; Q
 cks_s_glyph:
     sta str_s
-    ldx #31                  ; the old letters out (columns 35-38 of the bottom row), the new ones in, and the lives
+    ldx #15                  ; the old letter out (columns 37-38 of the bottom row), the new one in, and the lives
     lda #0                   ; icons over the edge of the last one
 cks_clear:
-    sta $6000+(24*40+35)*8,x
+    sta $6000+(24*40+37)*8,x
     dex
     bpl cks_clear
-    jsr draw_ks_indicator
+    jsr draw_sound_indicator
     jsr draw_lives_icons
 cks_rts:
     rts
@@ -895,16 +881,13 @@ fire_bullet_if_requested:
     beq fbr_read
     dec fire_delay
 fbr_read:
-    lda joy_flag
-    beq fbr_key
-    jsr read_joystick
-    and #$10                 ; fire button (0 = pressed)
-    jmp fbr_test
-fbr_key:
     lda #$FE               ; clear bit0: select column 0 (RETURN's column)
     sta $DC00
     lda $DC01
     and #$02                 ; row bit 1 = RETURN
+    beq fbr_held
+    jsr read_joystick
+    and #$10                 ; or the joystick's fire button (0 = pressed)
 fbr_test:
     beq fbr_held
     lda #0
@@ -2957,7 +2940,7 @@ she_go:
     jsr erase_ship_cells
     jsr draw_level_flags         ; the burst may have been drawn over the flags/lives/KS rows at the bottom
     jsr draw_lives_icons
-    jsr draw_ks_indicator
+    jsr draw_sound_indicator
     lda lives_out
     bne she_over
     lda #SHIP_START_COL
@@ -3987,7 +3970,7 @@ draw_title_loop:
 
     jsr draw_score_bar
     jsr draw_body_text
-    jsr draw_ks_indicator
+    jsr draw_sound_indicator
     jsr draw_level_flags
     rts
 
@@ -4203,32 +4186,24 @@ dbt_loop:
     bne dbt_loop
     rts
 
-; draw_ks_indicator: the "K"/"S" key-or-joystick hint, title screen AND
-; gameplay (BBC shows it during play too - see display_key_joy_status).
-; K and S are two separate table entries (two separate strings), not one
-; "KS" string, so they can have different colors: with the tight sub-
-; cell spacing, letters within ONE string can share a cell (see
-; print_bitmap_line), which would force them to the same color. Drawing
-; them separately, each starting fresh at color-pixel offset 0, keeps
-; their own spacing unchanged - S just starts 2 cells after K (K's own
-; span), the minimum gap that avoids sharing a cell, not extra space
-; added.
-draw_ks_indicator:
+; draw_sound_indicator: the sound hint (S, or Q when the sound is off), title screen AND gameplay (the BBC shows its
+; key/joystick and sound letters during play too - see display_key_joy_status; only the sound one is left).
+draw_sound_indicator:
     ldx #0
 dks_loop:
-    lda ks_table,x
+    lda sound_table,x
     sta temp2
-    lda ks_table+1,x
+    lda sound_table+1,x
     sta temp2+1
-    lda ks_table+2,x
+    lda sound_table+2,x
     sta temp3
-    lda ks_table+3,x
+    lda sound_table+3,x
     sta temp3+1
-    lda ks_table+4,x
+    lda sound_table+4,x
     sta temp4
-    lda ks_table+5,x
+    lda sound_table+5,x
     sta temp4+1
-    lda ks_table+6,x
+    lda sound_table+6,x
     sta colour
     stx dtt_saved_x
     jsr print_bitmap_line
@@ -4237,7 +4212,7 @@ dks_loop:
     clc
     adc #7
     tax
-    cpx #(2*7)
+    cpx #(1*7)
     bne dks_loop
     rts
 
@@ -4804,9 +4779,7 @@ body_text_table:
     .word str_superior, $6000+(21*40+7)*8,  $4000+21*40+7
     .byte 4                                              ; magenta
 
-ks_table:
-    .word str_k,        $6000+(24*40+35)*8, $4000+24*40+35
-    .byte 3                                              ; cyan
+sound_table:
     .word str_s,        $6000+(24*40+37)*8, $4000+24*40+37
     .byte 2                                              ; red
 
@@ -5217,8 +5190,6 @@ str_toplay:
     .byte 29,24,38,25,21,10,34,$FF                  ; TO PLAY (CHARP.asm pressspace2)
 str_superior:
     .byte 28,30,25,14,27,18,24,27,38,28,24,15,29,32,10,27,14,$FF ; SUPERIOR SOFTWARE (CHARP.asm copyr)
-str_k:
-    .byte 20,$FF                                    ; K (CHARP.asm key_joy_letter)
 str_s:
     .byte 28,$FF                                    ; S (CHARP.asm sound_letter)
 

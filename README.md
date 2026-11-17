@@ -41,8 +41,8 @@ Needs cc65 (`cl65`) and python3.
 | `;` or `=` / `/` | up / down |
 | RETURN | fire (hold for autorepeat) |
 | SPACE or RETURN | start a game from the title; also ends the demo |
-| K | keyboard or joystick (port 2); the letter in the bottom right corner shows K or J |
-| S | sound on or off; the letter shows S or Q |
+| joystick, port 2 | works at the same time as the keys: left, right, up, down, fire (the original's K switch is gone) |
+| S | sound on or off; the letter in the bottom right corner shows S or Q |
 | P | pause |
 | RUN/STOP | give up the game (loses every ship), as the original's ESCAPE; back to the title from the demo |
 
@@ -57,7 +57,8 @@ not contain: **1** skip to the next wave, **2** an extra ship, **3** invulnerabl
 The disk image (`make d64`) starts with `galaforce`, a small program made from the original disc (`disc/Disc025-Galaforce.ssd`),
 as the BBC's loader does it: first the MODE 7 instruction pages (the logo, the story, playing instructions, the pilot's
 briefing, the zones, game controls) in C64 text mode, SPACE or joystick fire for the next, RUN/STOP to skip them; then the
-loading picture, which stays up while the game (`game` on the disk) loads. The controls page lists the C64's keys instead of
+loading picture, which stays up for 5 seconds (any key or the joystick fire goes on sooner) and then while the game
+(`game` on the disk) loads. The controls page lists the C64's keys instead of
 the BBC's. The picture (MODE 5, 160 x 200 of it, four colours) is the C64's multicolour bitmap format already, so it is
 the disc's pixels, not a conversion; the block graphics of the logo are 64 extra characters; the flashing line flashes.
 `tools/make_intro.py` makes the data, `make test-intro` runs the program headless and draws every page and the picture to

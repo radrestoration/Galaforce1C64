@@ -185,7 +185,7 @@ PATCH = {
     550: 'PRINTTAB(14)CHR$130"; or = - Up"',
     560: 'PRINTTAB(14)CHR$130"/ - Down"',
     580: 'PRINT\'TAB(8)CHR$129"RUN/STOP - Exit from game"',
-    620: 'PRINTTAB(10)CHR$129;"K - Keyboard/Joystick 2":*FX15',
+    620: 'PRINTTAB(12)CHR$129;"Joystick in port 2":*FX15',
 }
 
 

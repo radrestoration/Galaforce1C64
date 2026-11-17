@@ -6,7 +6,7 @@
 ;; The data (picture, pages, block graphics) is made from the disc by tools/make_intro.py.
 
 .setcpu "6502"
-.export wait_key               ; (for the label file, tools/test_intro.py)
+.export wait_key, wait_picture  ; (for the label file, tools/test_intro.py)
 
 ptr     = $fb               ; 2
 dst     = $fd               ; 2
@@ -17,6 +17,8 @@ phase   = $f5               ; flashing text: 0 = shown, 1 = hidden
 frames  = $f4
 wmode   = $f3               ; 0 = draw the page, 1 = recolour its flashing runs
 runcol  = $f2
+cnt     = $f0               ; 2: frames left
+armed   = $ef               ; 1 = no key has been down since the picture came up
 
 CHARSET = $3800
 BITMAP  = $e000
@@ -79,6 +81,7 @@ start:
     bne @pages
 @picture:
     jsr show_picture
+    jsr wait_picture
     ; ---- the loader goes to $0334 (the game's file does not cover it), then runs ----
     ldx #loader_end - loader_src - 1
 @copy:
@@ -382,6 +385,80 @@ show_picture:
     bne @next
     lda #$3b
     sta $d011
+    rts
+
+; wait_picture: the picture stays up for 5 seconds (250 frames on a PAL machine, 300 on NTSC), or until a key or the
+; joystick is pressed; a key still down from the last page has to be let go first.
+wait_picture:
+    lda #0
+    sta tmp
+    sta armed
+@top:
+    lda $d011                   ; the raster counter's bit 8: set from line 256 to the end of the frame
+    bpl @top
+@scan:
+    lda $d012
+    cmp tmp
+    bcc @low
+    sta tmp                     ; the highest line seen: 311 (55 past 256) on PAL, 262 (6) on NTSC
+@low:
+    lda $d011
+    bmi @scan
+    lda #<250
+    ldx #>250
+    ldy tmp
+    cpy #24
+    bcs @pal
+    lda #<300
+    ldx #>300
+@pal:
+    sta cnt
+    stx cnt+1
+@frame:
+    lda $d011
+    bpl @frame
+@end:
+    lda $d011
+    bmi @end                    ; (a frame has passed)
+    jsr any_key
+    bne @down
+    lda #1
+    sta armed
+    bne @tick
+@down:
+    lda armed
+    bne @done
+@tick:
+    lda cnt
+    bne @lo
+    dec cnt+1
+@lo:
+    dec cnt
+    lda cnt
+    ora cnt+1
+    bne @frame
+@done:
+    lda #$ff
+    sta $dc00
+    rts
+
+; any_key: A = 1 if any key (every keyboard column at once) or the port 2 joystick is down, else 0
+any_key:
+    lda #0
+    sta $dc00
+    lda $dc01
+    cmp #$ff
+    bne @yes
+    lda #$ff
+    sta $dc00
+    lda $dc00
+    and #$1f
+    cmp #$1f
+    bne @yes
+    lda #0
+    rts
+@yes:
+    lda #1
     rts
 
 .segment "RODATA"
