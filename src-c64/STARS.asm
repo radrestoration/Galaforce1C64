@@ -193,6 +193,10 @@ is_row_protected:
  BEQ  irp_yes
  CMP  #24
  BEQ  irp_yes
+ CMP  t_row              ; the rows of the texts that are up (INIT.asm: zone message, completion message, GAME OVER,
+ BEQ  irp_yes            ; name prompt; $FF = none)
+ CMP  t_row+1
+ BEQ  irp_yes
  LDA  #0
  STA  star_row_protected
  RTS
@@ -308,18 +312,12 @@ si_done:
 ; noticeably slower than the fall. A star that respawns this tick always
 ; gets a fresh look immediately regardless of the color-tick timing (see
 ; star_respawn_top).
+; Every star moves once every STAR_SLOWDOWN calls, as before, but each call moves only every STAR_SLOWDOWN'th one (a
+; different third each time) instead of all of them on every third call: the same motion, without a pass that is 8000
+; cycles longer than the others (which made it take a second frame).
 movestars:
- INC  star_frame_count
- LDA  star_frame_count
- CMP  #STAR_SLOWDOWN
- BCC  ms_skip
- LDA  #0
- STA  star_frame_count
- JMP  ms_run
-ms_skip:
- RTS
-
-ms_run:
+ LDA  star_frame_count           ; 0 .. STAR_SLOWDOWN-1: which third moves now
+ BNE  ms_start                   ; (the colour timing counts whole cycles, so only the first call of one does it)
  INC  star_color_count
  LDA  star_color_count
  CMP  #STAR_COLOR_SLOWDOWN
@@ -333,7 +331,11 @@ ms_no_recolor:
  LDA  #0
  STA  ms_recolor_flag
 ms_start:
- LDX  #0
+ LDA  star_frame_count
+ ASL  A
+ CLC
+ ADC  star_frame_count           ; phase * 3 = the first star's offset (3 bytes a star)
+ TAX
 ms_loop:
  LDA  star_hidden,x
  BNE  ms_next             ; a hard object (ship/alien) currently owns this
@@ -354,7 +356,13 @@ ms_loop:
  CMP  #7
  BEQ  ms_wrap_row
  INC  stardat,x
- JMP  ms_pick_color
+ LDA  ms_recolor_flag
+ BNE  ms_pick_color
+ LDY  #1                 ; the common case: the star is one pixel row lower in the same cell, so the pointer the erase
+ LDA  stardat+2,x        ; used (temp3) plus one is where it goes
+ EOR  (temp3),y
+ STA  (temp3),y
+ JMP  ms_next
 
 ms_wrap_row:
  LDA  star_rowcnt,x
@@ -399,13 +407,21 @@ ms_draw:
  STA  (temp3),y          ; redraw at the new position
 
 ms_next:
- INX
- INX
- INX
+ TXA
+ CLC
+ ADC  #(3*STAR_SLOWDOWN)         ; the next star of this third
+ TAX
  CPX  #(STAR_COUNT*3)
- BEQ  ms_done
+ BCS  ms_done
  JMP  ms_loop
 ms_done:
+ INC  star_frame_count
+ LDA  star_frame_count
+ CMP  #STAR_SLOWDOWN
+ BCC  ms_rts
+ LDA  #0
+ STA  star_frame_count
+ms_rts:
  RTS
 
 star_frame_count:

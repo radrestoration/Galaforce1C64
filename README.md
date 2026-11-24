@@ -10,6 +10,7 @@ The BBC source is in `src/` (beebasm syntax, unmodified, reference only). This i
     make run                       # build and run in VICE (x64sc)
     make d64                       # build/galaforce1.d64: the loading screens, then the game (LOAD"*",8,1)
     make zip                       # build/Galaforce1-C64.zip: the release (disk image, game PRG, README)
+    make timing-build              # build/GalaForce1-c64-TIMING.PRG: the border shows what the CPU is doing (see below)
     make clean
 
 Needs cc65 (`cl65`) and python3.
@@ -43,8 +44,15 @@ Needs cc65 (`cl65`) and python3.
 | SPACE or RETURN | start a game from the title; also ends the demo |
 | joystick, port 2 | works at the same time as the keys: left, right, up, down, fire (the original's K switch is gone) |
 | S | sound on or off; the letter in the bottom right corner shows S or Q |
-| P | pause |
+| P | pause (the P in the bottom right corner, as the original shows it) |
 | RUN/STOP | give up the game (loses every ship), as the original's ESCAPE; back to the title from the demo |
+
+### Timing build
+
+`make timing-build` (`make run-timing`) builds `build/GalaForce1-c64-TIMING.PRG`, which colours the border by what the CPU is doing, so on a
+real machine the stripes down the sides of the screen show how much of a frame each part of the game takes: black = waiting for the
+next frame, red = building the sprite list, blue = the rest of a game loop pass (while playing it is split: white = the stars, cyan = the ship and its bullets, purple = the aliens' bullets, orange = the aliens' movement, brown = ship bullets against aliens, light grey = aliens against the ship), yellow and green = the sprite and music interrupts.
+A pass whose red and blue run on past the end of the frame is taking more than a frame. The real build has none of this.
 
 ### Test build
 
@@ -86,6 +94,15 @@ high, so the vertical layout has to be squeezed to 200.
 The game logic is a reimplementation that follows the BBC source (alien types, spawn waves, flight patterns,
 scoring, lives, high scores), not a line-by-line translation; comments in `INIT.asm` cite the BBC routines.
 
+## Screens and messages
+
+As in the original: the main screen for 256 frames, the high scores for 256, then the demo, on a random wave from 0 to 7; after a
+demo's game over it starts again from the main screen, and the demo's music goes on through those screens without a restart. "ENTERING ZONE nn" appears at the start
+of every life and wave for about 4 seconds (the original's 256 passes, counted on the BBC code), while the ship, its shots and the
+stars carry on and the aliens wait. SATURN, BATTERY and TURBO appear under it on arriving at wave 16, 32 and 48, flashing red and cyan
+(the BBC's default flash rate: the source does not set another). GAME OVER shows during the game-over tune, and ENTER YOUR NAME while
+a new high score's name is typed.
+
 ## Music and sound
 
 The notes, tempo and rhythm of every tune are the original's: `tools/make_music.py` reads `MUSIC1-3.asm` and writes
@@ -101,10 +118,26 @@ The extra life (the first time the score reaches 20000) and the "last man" sound
 play) are the original's, with their own warbling effects. As in the original a game has the ship in play plus three
 spares, and is over when a ship is lost with none left.
 
+## Checked against the original
+
+Every table the game takes from the original (spawn groups, flight-pattern bytecode, wave lists and pool sizes, hit points, scores,
+the direction tables) is compared with the BBC source files by a script, and all match. The alien paths of all 16 waves were also
+compared with the original running headless: every path the original flies is flown by the port (waves 1 and 8 miss a couple of
+a child alien's paths in the window compared). Differences that were found and fixed: spawn positions cut to cells, the random start
+columns (78, 79), the in-flight left/right wrap, spawn groups 28-45 reading the wrong rows of the table, a child alien's random type,
+losing a ship (the original replays the group in progress, not the whole wave), the score field (7 digits, no leading zeros, past
+99990) and the high-score table's layout.
+
 ## Known gaps and choices
 
 - Bullets, stars, the ship's explosion and the HUD are bitmap, not sprites; collisions test whole character cells,
   not the original's pixel boxes.
+- With 8 or more aliens on screen the sprite list is rebuilt every other frame (the ship, its shots and the game itself still run
+  every frame), so the aliens' sprites move in steady half-rate steps. A game loop pass that runs over a frame starts the next at
+  once instead of waiting for the next frame, so the game slows down in proportion to the overrun (as the BBC's does) rather than
+  dropping to half speed. A row of 8 aliens needs more sprites than there are, so one in a row is moved down some lines; the
+  32-alien swarm waves are the heaviest case.
+- The "HIGH SCORES" heading is the port's own; the original shows only the rows.
 - In the demo the ship stays on the bottom row (a port choice). The demo ends at its own game over, or on
   SPACE/RETURN, which starts a real game.
 - Alien bombs follow BOMBS2.asm: a random alien drops one on about 1 pass in 16, each bomb is fast or slow, and from

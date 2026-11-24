@@ -82,11 +82,13 @@ def pool():
     m = cpu.m
     n = m[lbl["alien_pool_max"]]
     out = []
+    slots = []
     for i in range(min(n, 40)):
         if m[lbl["alien_active"] + i]:
+            slots.append(i)
             out.append((m[lbl["alien_x"] + i], m[lbl["alien_y"] + i], m[lbl["alien_type"] + i],
                         m[lbl["alien_exploding"] + i], m[lbl["alien_explode_timer"] + i]))
-    return dict(swarm=0, aliens=out, wave=m[lbl["c64_curwave"]], state=m[lbl["game_state"]],
+    return dict(swarm=0, aliens=out, slots=slots, wave=m[lbl["c64_curwave"]], state=m[lbl["game_state"]],
                 demo=m[lbl["demo_flag"]])
 
 
@@ -108,6 +110,14 @@ def wr_hook(a, v):
 
 cpu.write_hooks.append(wr_hook)
 
+_c = os.environ.get("CALL")
+CALL = None
+if _c:
+    _p = _c.split(":")
+    CALL = (_p[0], int(_p[1]), int(_p[2]) if len(_p) > 2 else None)
+call_done = False
+gl_times = []                                   # the cycle count at every game loop pass
+DUMPAT = sorted(int(v) for v in os.environ.get("DUMPAT", "").split(",") if v)
 START_WAVE = os.environ.get("WAVE")      # WAVE=3: begin the game on that wave (3, 7 and 11 end in the swarm)
 started = False
 tune_done = False
@@ -175,6 +185,18 @@ while cpu.cycles < FRAMES * frame_cycles:
         cpu.push((lbl["game_loop"] - 1) & 255)
         cpu.a = int(os.environ["TUNE"])
         cpu.pc = lbl["music_start"]
+    if cpu.pc == lbl["game_loop"]:
+        gl_times.append(cpu.cycles)
+    if CALL and not call_done and cpu.pc == lbl["game_loop"] and cpu.cycles // frame_cycles >= CALL[1]:
+        call_done = True                     # CALL=label:frame[:wave]: run that routine (as a JSR) at the first game loop pass from that frame on
+        if CALL[2] is not None:
+            cpu.m[lbl["c64_curwave"]] = CALL[2]
+        cpu.push((lbl["game_loop"] - 1) >> 8)
+        cpu.push((lbl["game_loop"] - 1) & 255)
+        cpu.pc = lbl[CALL[0]]
+    if DUMPAT and cpu.pc in (lbl["game_loop"], lbl.get("hen_loop")) and cpu.cycles // frame_cycles >= DUMPAT[0]:
+        f_ = DUMPAT.pop(0)                   # DUMPAT=f1,f2,...: the bitmap area ($4000-$7FFF) to DUMPFILE.<f> at the first game loop pass from each frame
+        open("%s.%d" % (os.environ["DUMPFILE"], f_), "wb").write(bytes(cpu.m[0x4000:0x8000]))
     if START_WAVE is not None and not started and cpu.pc == lbl["game_loop"]:
         started = True                       # the game has just started: switch to the wave asked for
         cpu.m[lbl["c64_curwave"]] = int(START_WAVE)
@@ -184,6 +206,9 @@ while cpu.cycles < FRAMES * frame_cycles:
         awaiting = True
         if os.environ.get("SCORE"):          # SCORE=<n>: start with that many ten-thousands, so the game over reaches name entry
             cpu.m[lbl["score_digits"] + 3] = int(os.environ["SCORE"])
+        if os.environ.get("SCORE6"):         # SCORE6=a,b,c,d,e,f: score_digits (tens first), the field is redrawn by the first kill
+            for _i, _v in enumerate(os.environ["SCORE6"].split(",")):
+                cpu.m[lbl["score_digits"] + _i] = int(_v)
     elif START_WAVE is not None and started and awaiting and cpu.pc == lbl["game_loop"]:
         awaiting = False
         if os.environ.get("SWARM"):          # SWARM=<n>: skip to group n of the wave's list (6 = the swarm in waves 3 and 7)
@@ -238,6 +263,10 @@ while cpu.cycles < FRAMES * frame_cycles:
 
 print(f"ran {cpu.cycles // frame_cycles} frames at {CPL} cycles/line, {irqs} IRQs, {len(snaps)} sprite lists built, "
       f"{len(events)} VIC writes; pc=${cpu.pc:04X}")
+if os.environ.get("PEEKN"):                     # PEEKN=label:n,...: n bytes from each exported label at the end
+    for _it in os.environ["PEEKN"].split(","):
+        _l, _n = _it.split(":")
+        print("peekn %s:" % _l, list(cpu.m[lbl[_l]:lbl[_l] + int(_n)]))
 if os.environ.get("PEEK"):                      # PEEK=label,label: the value of those exported variables at the end
     print("peek:", {n: cpu.m[lbl[n]] for n in os.environ["PEEK"].split(",")})
 if HASH:
@@ -269,6 +298,9 @@ if PROF and passes:
     print("per pass, cycles called from game_loop (inclusive) over %d passes; frame = %d cycles; mean / max / passes over 12000:" % (n, frame_cycles))
     for k, v in sorted(agg.items(), key=lambda kv: -sum(kv[1]))[:14]:
         print("  %-26s %6d %6d %5d" % (k, sum(v) / n, max(v), sum(1 for x in v if x > 12000)))
+    if os.environ.get("DECILES"):              # DECILES=call: that call's cycles per pass, at every 10th percentile
+        _v = sorted(agg[os.environ["DECILES"]])
+        print("%s per pass, deciles:" % os.environ["DECILES"], [_v[min(len(_v) - 1, len(_v) * q // 10)] for q in range(11)])
     slow = collections.Counter(max(ps, key=ps.get) for ps in passes if sum(ps.values()) > 12000)
     print("passes over one frame: %d of %d; biggest single call in them: %s" % (sum(slow.values()), n, dict(slow.most_common(6))))
     tots = sorted(sum(ps.values()) for ps in passes)
@@ -283,6 +315,10 @@ if os.environ.get("PACE"):                    # PACE=1: how many frames each gam
     h = collections.Counter(min(int(x + 0.5), 6) for x in d)
     print("frames per game loop pass (rounded) -> passes:", dict(sorted(h.items())))
     print("first 60 passes:", d[:60])
+    _g = [(b - a) / frame_cycles for a, b in zip(gl_times, gl_times[1:]) if a > 600 * frame_cycles]   # from the game's start on
+    if _g:
+        _s = sorted(_g)
+        print("game loop passes (from frame 600): %d, mean %.2f frames, median %.2f, 90th percentile %.2f, over 1.5 frames: %.1f%%, over 2.5: %.1f%%" % (len(_g), sum(_g) / len(_g), _s[len(_s) // 2], _s[len(_s) * 9 // 10], 100.0 * sum(1 for x in _g if x > 1.5) / len(_g), 100.0 * sum(1 for x in _g if x > 2.5) / len(_g)))
     swb = [b for b, sn in zip(builds, snaps) if sn["swarm"]]
     if swb and COUNT_AT is not None:
         f0, f1 = swb[0] // frame_cycles, swb[-1] // frame_cycles

@@ -38,4 +38,28 @@ IRQVec         := $0314
 BRKVec         := $0316
 NMIVec         := $0318
 
+
+; TMCOL c: only in the timing build (make timing-build, --asm-define TIMING=1): the border colour shows what the CPU is doing, so
+; on a real machine the stripes down the sides of the screen show how much of a frame each part of the game takes. The
+; interrupts paint their own colour and put back the main loop's (tm_cur) when they end.
+.macro TMCOL c
+.ifdef TIMING
+    lda #c
+    sta $D020
+    sta tm_cur
+.endif
+.endmacro
+.macro TMIRQ c
+.ifdef TIMING
+    lda #c
+    sta $D020
+.endif
+.endmacro
+.macro TMBACK
+.ifdef TIMING
+    lda tm_cur
+    sta $D020
+.endif
+.endmacro
+
 .endif

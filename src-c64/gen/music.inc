@@ -14,6 +14,7 @@ SFX_HIT = 1
 SFX_CRASH = 2
 SFX_XLIFE = 3
 SFX_LSTMAN = 4
+SFX_BELL = 5
 
 mus_streams:
 mus_LOST1:
@@ -134,9 +135,9 @@ mus_fpal_hi:
  .byte 8,8,9,9,10,10,11,12,12,13,14,15,16,17,18,19,20,21,22,24,25,27,28,30,32,34,36,38,40,43,45,48,51,54,57,61,64,68,72,77,81,86,91,97,102,108,115,122,129,137,145,154,163,172,183,194,205,217,230,244,255,255,255,255
 
 mus_fx_lo:
- .byte <mus_fx_fire,<mus_fx_hit,<mus_fx_crash,<mus_fx_xlife,<mus_fx_lstman
+ .byte <mus_fx_fire,<mus_fx_hit,<mus_fx_crash,<mus_fx_xlife,<mus_fx_lstman,<mus_fx_bell
 mus_fx_hi:
- .byte >mus_fx_fire,>mus_fx_hit,>mus_fx_crash,>mus_fx_xlife,>mus_fx_lstman
+ .byte >mus_fx_fire,>mus_fx_hit,>mus_fx_crash,>mus_fx_xlife,>mus_fx_lstman,>mus_fx_bell
 mus_fx_fire:
  .byte 65,0,3,3,2
  .byte 8,250,140,108,241
@@ -206,4 +207,8 @@ mus_fx_lstman:
  .byte 3,24,118,232,242
  .byte 3,209,78,24,13
  .byte 3,24,118,232,242
+ .byte 0
+mus_fx_bell:
+ .byte 65,0,8,0,209
+ .byte 15,132,33,0,0
  .byte 0

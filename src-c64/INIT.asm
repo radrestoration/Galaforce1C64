@@ -98,20 +98,16 @@ exec:
 ; just-finished game ended on instead of the attract-mode defaults.
 title_wait_loop:
     jsr spr_reset
-    jsr music_stop               ; the title and high-score screens have no music
+    lda demo_flag                ; the title and high-score screens have no music of their own, but after a demo the
+    bne twl_music_on             ; demo's goes on through them (demo_flag stays set until a key starts a game)
+    jsr music_stop
+twl_music_on:
     lda #3
     sta lives_count
     lda #1
     sta level_ones
     lda #0
-    sta score_digits
-    sta score_digits+1
-    sta score_digits+2
-    sta score_digits+3
-    sta score_glyphs
-    sta score_glyphs+1
-    sta score_glyphs+2
-    sta score_glyphs+3
+    jsr reset_score
 
     lda #0
     sta title_frame_count
@@ -121,6 +117,7 @@ twl_wait_raster:
     cmp $D012
     bne twl_wait_raster
     jsr movestars
+    jsr demo_music
     jsr check_start_key
     beq manual_game_start
     inc title_frame_count
@@ -145,6 +142,7 @@ hs_wait_raster:
     cmp $D012
     bne hs_wait_raster
     jsr movestars
+    jsr demo_music
     jsr check_start_key
     beq manual_game_start
     inc title_frame_count
@@ -158,6 +156,9 @@ hs_wait_raster:
 ; belongs here once there's more than the fixed wave-0 spawn table
 ; (init_alien_wave) to select from. ---
 start_demo:
+    jsr demo_rand
+    and #7                  ; into_demo: a random start wave, 0-7
+    sta start_wave
     lda #1
     sta demo_flag
     lda #0
@@ -173,12 +174,20 @@ start_demo:
 manual_game_start:
     lda #0
     sta demo_flag
+    sta start_wave           ; a real game starts at wave 0
 
 ; --- Game start: wipe the screen, fresh stars, drop the ship in at its
 ; start column, and draw the score bar / level flags / lives icon on the
 ; now-blank game screen (clear_screen wiped them along with everything
 ; else). ---
 game_start:
+    lda #0                   ; (clear_screen below wipes any zone message that was up)
+    sta msg_active
+    sta comp_on
+    sta sixteen_flag         ; restart: "STAsixteen_flag" (+ve: the completion message may be shown)
+    lda #$FF
+    sta t_row
+    sta t_row+1
     jsr spr_reset
     jsr clear_screen
     jsr star_init
@@ -200,20 +209,15 @@ gs_clr_abullets:
 
     lda #3
     sta lives_count
-    lda #1
+    lda start_wave           ; wave 0 (the demo: a random one); the level number is the wave + 1
+    sta c64_curwave
+    clc
+    adc #1
     sta level_ones
     lda #0
     sta xlife_given
-    sta c64_curwave
     sta game_state
-    sta score_digits
-    sta score_digits+1
-    sta score_digits+2
-    sta score_digits+3
-    sta score_glyphs
-    sta score_glyphs+1
-    sta score_glyphs+2
-    sta score_glyphs+3
+    jsr reset_score
 
     jsr draw_score_bar
     jsr draw_sound_indicator
@@ -234,14 +238,45 @@ gs_clr_abullets:
     lda #MUS_START
     jsr music_start
 gs_no_tune:
+    jsr show_zone_message    ; INIT.asm's first_life: "ENTERING ZONE n"
 
+; The game loop runs one pass a frame, starting at raster line 250 (below the picture). A pass that finishes early waits for the next
+; frame's line 250, as it always did. One that runs LATE starts the next at once: it used to wait for the next line 250 all the same,
+; so a pass only a few lines over cost two whole frames, and every pass a little over a frame's worth of work ran at half speed,
+; the aliens skipping ahead. Now the game slows down in proportion to the overrun instead, as the BBC's does. (gl_pass_c: the frame
+; counter at the start of the last pass; a pass is late when it is two frames on, or one frame on and the raster is past line 250.)
 game_loop:
-    lda #250
-gl_wait_raster:
-    cmp $D012
-    bne gl_wait_raster
+    TMCOL 0                    ; black: waiting for the next frame
+    lda sz_vcount
+    sec
+    sbc gl_pass_c
+    cmp #2
+    bcs gl_go                  ; two frames or more: late
+    cmp #1
+    beq gl_one
+gl_w0:                         ; not even a frame yet: wait for the next one to begin (the counter ticks at line 8)
+    lda sz_vcount
+    cmp gl_pass_c
+    beq gl_w0
+gl_one:
+    lda $D011                  ; a frame has begun: on to line 250, unless the raster is there or past it already
+    bmi gl_go
+    lda $D012
+    cmp #250
+    bcs gl_go
+gl_w250:
+    lda $D011
+    bmi gl_go                  ; (raster lines 256 and up)
+    lda $D012
+    cmp #250
+    bcc gl_w250
+gl_go:
+    lda sz_vcount
+    sta gl_pass_c
 
-    jsr spr_build              ; next frame's sprite list, from the alien pool as the last frame left it
+    TMCOL 2                    ; (timing build) red: the sprite list
+    jsr spr_build_frame
+    TMCOL 6                    ; blue: the rest of the pass        ; next frame's sprite list, from the alien pool as the last frame left it (every other frame when there are many aliens)
 
     lda demo_flag            ; any start key ends the demo and starts a real game
     beq gl_not_demo
@@ -287,6 +322,7 @@ gl_pause_pressed:
     lda game_paused
     eor #1
     sta game_paused
+    jsr toggle_pause_letter      ; ROUT1.asm's pause: the P letter
 gl_pause_checked:
     lda game_paused
     beq gl_not_paused
@@ -297,19 +333,35 @@ gl_not_paused:
 .ifdef CHEAT
     jsr check_cheats
 .endif
+    TMCOL 1                      ; (timing build: white = the stars)
     jsr movestars
+    TMCOL 6
     jsr demo_music
 
     lda game_state
     cmp #GS_SHIP_EXPLODING
-    bcs gl_exploding            ; exploding, or the game is over
+    bcc gl_not_exploding
+    jmp gl_exploding            ; exploding, or the game is over
+gl_not_exploding:
 
+    lda msg_active           ; ROUT4.asm's message_loop: the ship, its bullets and the stars carry on, the aliens wait
+    beq gl_no_message
+    jsr process_demo
+    jsr handle_ship_input
+    jsr fire_bullet_if_requested
+    jsr demo_process_fire
+    jsr move_bullets
+    jsr message_tick
+    jmp game_loop
+gl_no_message:
+    TMCOL 3                      ; cyan = the ship and its bullets
     jsr process_demo
     jsr check_xlife
     jsr handle_ship_input
     jsr fire_bullet_if_requested
     jsr demo_process_fire
     jsr move_bullets
+    TMCOL 4                      ; purple = the aliens' bullets
     jsr move_alien_bullets
     jsr random_alien_bomb
 
@@ -322,12 +374,17 @@ gl_not_paused:
     lda game_state
     cmp #GS_PLAYING
     bne game_loop_no_wave_check
+    TMCOL 8                      ; orange = the aliens' movement
     jsr try_load_next_group
 game_loop_no_wave_check:
+    TMCOL 8
     jsr alien_move_tick
+    TMCOL 9                      ; brown = ship bullets against aliens
     jsr check_bullet_alien_collisions
+    TMCOL 15                     ; light grey = the aliens against the ship
     jsr check_alien_bullet_ship_collision
     jsr check_alien_ship_collision
+    TMCOL 6
     jmp game_loop
 gl_exploding:
     lda game_state
@@ -352,23 +409,35 @@ gl_again:
 ; HIGH.asm's ahigh has no "quit early" concept to match against, and it
 ; would be misleading to score-check an arbitrary mid-game escape.
 game_loop_escape:
-    jsr music_stop               ; (the demo's tune may still be playing)
+    lda demo_flag                ; a demo's music goes on through the title cycle; a game's stops
+    bne gle_music_on
+    jsr music_stop
+gle_music_on:
+    jsr hide_zone_message
+    ldx #0                       ; (GAME OVER is in slot 0 without the message being up)
+    jsr txt_hide
     jsr spr_reset                ; no aliens or ship on the title and high-score screens
     lda game_state
     cmp #GS_GAME_OVER
     bne gle_to_title
+    lda demo_flag                ; the demo has no high score to enter
+    bne gle_to_title
+    jsr hs_qualifies             ; HIGH.asm's ahigh: the table only comes up for a new high score
+    beq gle_to_title
     ; Clear and draw the table BEFORE hs_try_insert, not after - if it
     ; decides to insert, hs_enter_name's live per-keystroke redraws
     ; (hs_draw_row) need the existing rows already on screen to look
     ; right while typing, matching real HIGH.asm's own ah9 ordering
-    ; (JSRpht, THEN JSRgnam, THEN JMPpht again once done - our second
-    ; "pht" is show_high_scores' own fuller redraw below, which also
-    ; restores the score bar/flags/lives/stars clear_screen just wiped).
+    ; (JSRpht, THEN JSRgnam, THEN JMPpht again once done).
     jsr clear_screen
     jsr draw_high_score_table
     jsr hs_try_insert
-    jsr show_high_scores
 gle_to_title:
+    ; INIT.asm's wait_for_space, whichever way the game ended (a demo included): the main screen for 256 frames, then the
+    ; high scores for 256 (title_wait_loop runs on into show_high_scores and that into start_demo), then the next demo
+    jsr clear_screen
+    jsr draw_title_screen
+    jsr star_init
     jmp title_wait_loop
 
 ; title_frame_count was previously declared inline between game_start's
@@ -383,6 +452,10 @@ gle_to_title:
 ; well clear of any fall-through path (this is only ever reached via the
 ; jmp above, never by falling off the end of something).
 title_frame_count:
+ .byte 0
+gl_pass_c:
+ .byte 0
+tm_cur:
  .byte 0
 
 ; demo_music: ROUT4/INIT.asm's dem_sound - while the demo plays, each time its tune has ended the next section's tune
@@ -407,6 +480,395 @@ dm_ok:
     jmp music_start
 dm_rts:
     rts
+
+; ---- Text that comes and goes on the playing screen: the zone message, the completion message, GAME OVER, the name prompt.
+; The original XOR-prints a string and prints it again to take it away. Here the text is ORA'd into the bitmap (that is
+; print_bitmap_line) and taken away by clearing its cells, so for as long as it is up its row counts as protected
+; (STARS.asm's is_row_protected looks at t_row): no star or bullet is drawn into it. Two texts can be up at once (slots 0
+; and 1: the zone message and, below it, the completion message).
+;
+; The positions are the original's CHARP.asm strings: the BBC address gives the character row and the 2-pixel byte
+; column, so the pixel column is 2 x byte; a C64 cell is 4 pixels wide, so an odd byte column starts 2 pixels into its cell
+; (print_bitmap_line_off2). Rows are scaled 256 -> 200 lines like the other texts (BBC row 22 -> 16, 8 -> 6, 13 -> 10).
+t_row:   .byte $FF,$FF               ; per slot: the protected row while the text is up, else $FF
+t_blo:   .byte 0,0                   ; bitmap address of the first cell
+t_bhi:   .byte 0,0
+t_mlo:   .byte 0,0                   ; screen-matrix address of the first cell
+t_mhi:   .byte 0,0
+t_n:     .byte 0,0                   ; cells it may touch
+
+; txt_show: X = slot, A = cells it may touch, Y = 0 or 1 (1: the first letter starts 2 pixels into its cell),
+; temp2 = the string, temp3 = bitmap address and temp4 = matrix address of the first cell, colour = its colour.
+; The caller then puts the row in t_row,x.
+txt_show:
+    sta t_n,x
+    lda temp3
+    sta t_blo,x
+    lda temp3+1
+    sta t_bhi,x
+    lda temp4
+    sta t_mlo,x
+    lda temp4+1
+    sta t_mhi,x
+    cpy #0
+    bne ts_off2
+    jmp print_bitmap_line        ; (it moves any star in those cells out of the way)
+ts_off2:
+    jmp print_bitmap_line_off2
+
+; txt_hide: X = slot. The text goes (bitmap cells and their colours back to the plain background), stars that were moved
+; out of the way come back, and a bullet in the row - never drawn there - is dropped. Safe when it is not up.
+txt_hide:
+    lda t_row,x
+    cmp #$FF
+    beq th_rts
+    stx th_slot
+    lda t_blo,x
+    sta temp2
+    lda t_bhi,x
+    sta temp2+1
+    lda t_n,x
+    asl a
+    asl a
+    asl a
+    tay
+    dey
+    lda #0
+th_clr:
+    sta (temp2),y
+    dey
+    cpy #$FF
+    bne th_clr
+    lda t_mlo,x
+    sta temp2
+    lda t_mhi,x
+    sta temp2+1
+    ldy t_n,x
+    dey
+    lda #$73                     ; clear_screen's background cell colours
+th_mat:
+    sta (temp2),y
+    dey
+    bpl th_mat
+    ldx #BULLET_COUNT-1
+    ldy th_slot
+th_bul:
+    lda bullet_active,x
+    beq th_bnext
+    lda bullet_row,x
+    cmp t_row,y
+    bne th_bnext
+    lda #0
+    sta bullet_active,x
+th_bnext:
+    dex
+    bpl th_bul
+    ldx th_slot
+    lda t_blo,x
+    sta sce_range_lo
+    lda t_bhi,x
+    sta sce_range_hi
+    lda t_n,x
+    asl a
+    asl a
+    asl a
+    sta sce_range_len
+    jsr star_restore_range
+    ldx th_slot
+    lda #$FF
+    sta t_row,x
+th_rts:
+    rts
+th_slot: .byte 0
+
+; ---- The zone message. ROUT4.asm's message_loop: at the start of every life and wave "ENTERING ZONE nn" is printed
+; (CHARP.asm's entering_wave: glyph codes, 16 of them, nn = the wave + 1, tens and ones as the digit glyphs), the
+; ship, its bullets and the stars carry on for 256 passes of the loop while the aliens wait, then the text is taken
+; away. Those 256 passes take the BBC 4.03 s (counted headless: 8,049,591 cycles at 2 MHz); here it is 200 ticks of the
+; 50 Hz clock. &5108 = character row 13, byte 17: pixel 34, row 10 here, white (the BBC's colour 63).
+MSG_ROW    = 10
+MSG_CELLS  = 25                      ; pixels 34-129 = cells 8-32
+MSG_TICKS  = 200
+MSG_BITMAP = $6000 + MSG_ROW*320 + 8*8
+MSG_MATRIX = $4000 + MSG_ROW*40 + 8
+msg_active: .byte 0
+msg_left:   .byte 0
+msg_last:   .byte 0
+msg_elapsed: .byte 0
+start_wave: .byte 0                  ; the wave a new game starts on: 0, or the demo's random one
+msg_str:
+    .byte 14,23,29,14,27,18,23,16,38,35,24,23,14,38   ; ENTERING ZONE<space>
+msg_digits:
+    .byte 0,0,$FF                                     ; the wave + 1: tens, ones
+
+; The completion message (ROUT4.asm's completion_message, CHARP.asm's finish1-3): on arriving at wave 16, 32 and 48 (and
+; not again if a ship is lost there: sixteen_flag), SATURN, BATTERY and TURBO appear under the zone message, in
+; the BBC's colour 9, which flashes red and cyan (the OS's default flash, 25 frames each = 25 ticks here: neither the
+; source nor the loader sets another). Row 16 on the BBC, 12 here.
+sixteen_flag: .byte 0                ; $FF once the completion message has been shown for this wave
+comp_on:    .byte 0
+comp_col:   .byte 0
+comp_left:  .byte 0
+COMP_FLASH = 25
+COMP_ROW   = 12
+comp_str_lo: .byte <comp_str0, <comp_str1, <comp_str2
+comp_str_hi: .byte >comp_str0, >comp_str1, >comp_str2
+comp_col_x: .byte 16, 15, 17         ; first cell: the BBC pixels 64, 60 and 68
+comp_cells: .byte 9, 11, 8           ; 6, 7 and 5 letters of 6 pixels
+comp_str0: .byte 28,10,29,30,27,23,$FF               ; SATURN
+comp_str1: .byte 11,10,29,29,14,27,34,$FF            ; BATTERY
+comp_str2: .byte 29,30,27,11,24,$FF                  ; TURBO
+
+show_zone_message:
+    lda c64_curwave
+    clc
+    adc #1                       ; message_loop: "SEC:LDXcurwave:INX:TXA", then the tens by repeated subtraction
+    ldy #$FF
+szm_div:
+    iny
+    cmp #10
+    bcc szm_got
+    sbc #10
+    bcs szm_div
+szm_got:
+    sty msg_digits
+    sta msg_digits+1
+    lda #<msg_str
+    sta temp2
+    lda #>msg_str
+    sta temp2+1
+    lda #<MSG_BITMAP
+    sta temp3
+    lda #>MSG_BITMAP
+    sta temp3+1
+    lda #<MSG_MATRIX
+    sta temp4
+    lda #>MSG_MATRIX
+    sta temp4+1
+    lda #1
+    sta colour
+    ldx #0
+    ldy #1                       ; byte 17 = pixel 34 = 2 pixels into cell 8
+    lda #MSG_CELLS
+    jsr txt_show
+    lda #MSG_ROW
+    sta t_row
+    jsr show_completion
+    lda #MSG_TICKS
+    sta msg_left
+    lda m_clock
+    sta msg_last
+    lda #1
+    sta msg_active
+    rts
+
+; show_completion: the completion message, if this wave has one and it has not been shown yet.
+show_completion:
+    lda c64_curwave
+    and #15
+    bne sc_none
+    lda c64_curwave
+    lsr a
+    lsr a
+    lsr a
+    lsr a
+    beq sc_none                  ; wave 0
+    sec
+    sbc #1                       ; wave 16, 32, 48 -> 0, 1, 2
+    cmp #3
+    bcs sc_none                  ; finish4 is empty
+    ldx sixteen_flag
+    bmi sc_none
+    tax
+    lda comp_str_lo,x
+    sta temp2
+    lda comp_str_hi,x
+    sta temp2+1
+    lda comp_col_x,x             ; first cell: bitmap = $6000 + COMP_ROW*320 + 8*cell, matrix = $4000 + COMP_ROW*40 + cell
+    sta temp4
+    asl a
+    asl a
+    asl a                        ; cell * 8 (at most 17 * 8: one byte, and no carry into the high byte)
+    clc
+    adc #<($6000 + COMP_ROW*320)
+    sta temp3
+    lda #>($6000 + COMP_ROW*320)
+    adc #0
+    sta temp3+1
+    lda temp4
+    clc
+    adc #<($4000 + COMP_ROW*40)  ; (no carry either: $E0 + 17)
+    sta temp4
+    lda #>($4000 + COMP_ROW*40)
+    sta temp4+1
+    lda #2                       ; the flash starts on its first colour, red
+    sta colour
+    sta comp_col
+    lda comp_cells,x
+    pha
+    ldx #1
+    ldy #0
+    pla
+    jsr txt_show
+    lda #COMP_ROW
+    sta t_row+1
+    lda #COMP_FLASH
+    sta comp_left
+    lda #1
+    sta comp_on
+sc_none:
+    rts
+
+; message_tick: once a pass while the message is up; makes the completion message flash and takes the message away
+; when its time has run out.
+message_tick:
+    lda m_clock
+    tax
+    sec
+    sbc msg_last
+    stx msg_last
+    sta msg_elapsed
+    lda comp_on
+    beq mt_noflash
+    lda comp_left
+    sec
+    sbc msg_elapsed
+    bcs mt_flash_keep
+    lda comp_col                 ; its time is up: the other colour
+    eor #1                       ; 2 <-> 3
+    sta comp_col
+    lda t_mlo+1
+    sta temp2
+    lda t_mhi+1
+    sta temp2+1
+    ldy t_n+1
+    dey
+mt_fill_loop:
+    lda comp_col
+    sta (temp2),y
+    dey
+    bpl mt_fill_loop
+    lda #COMP_FLASH
+mt_flash_keep:
+    sta comp_left
+mt_noflash:
+    lda msg_left
+    sec
+    sbc msg_elapsed
+    bcc hide_zone_message
+    sta msg_left
+    bne mt_rts
+    jmp hide_zone_message
+mt_rts:
+    rts
+
+; hide_zone_message: both texts go. Safe to call when they are not up. (The completion message, once taken away, is not
+; shown again at this wave: completion_message's second call sets sixteen_flag.)
+hide_zone_message:
+    lda msg_active
+    beq hzm_rts
+    lda #0
+    sta msg_active
+    ldx #0
+    jsr txt_hide
+    ldx #1
+    jsr txt_hide
+    lda comp_on
+    beq hzm_rts
+    lda #0
+    sta comp_on
+    lda #$FF
+    sta sixteen_flag
+hzm_rts:
+    rts
+
+; GAME OVER (ROUT4.asm's game_over_loop, CHARP.asm's gameover: BBC byte 27 of row 11 = pixel 54, row 8 here, cyan) while the
+; game-over tune plays. game_loop_escape clears the screen afterwards.
+GO_ROW = 8
+game_over_str: .byte 16,10,22,14,38,24,31,14,27,$FF  ; GAME OVER
+show_game_over:
+    lda #<game_over_str
+    sta temp2
+    lda #>game_over_str
+    sta temp2+1
+    lda #<($6000 + GO_ROW*320 + 13*8)
+    sta temp3
+    lda #>($6000 + GO_ROW*320 + 13*8)
+    sta temp3+1
+    lda #<($4000 + GO_ROW*40 + 13)
+    sta temp4
+    lda #>($4000 + GO_ROW*40 + 13)
+    sta temp4+1
+    lda #3
+    sta colour
+    ldx #0
+    ldy #1
+    lda #14
+    jsr txt_show
+    lda #GO_ROW
+    sta t_row
+    rts
+
+; ENTER YOUR NAME (HIGH.asm's ahigh: zc printed before the name is typed and again to take it away; &3D00 = row 5, byte 16 =
+; pixel 32, row 4 here, cyan), while a new high score's name is being typed.
+NAME_ROW = 4
+name_str: .byte 14,23,29,14,27,38,34,24,30,27,38,23,10,22,14,$FF   ; ENTER YOUR NAME
+show_name_prompt:
+    lda #<name_str
+    sta temp2
+    lda #>name_str
+    sta temp2+1
+    lda #<($6000 + NAME_ROW*320 + 8*8)
+    sta temp3
+    lda #>($6000 + NAME_ROW*320 + 8*8)
+    sta temp3+1
+    lda #<($4000 + NAME_ROW*40 + 8)
+    sta temp4
+    lda #>($4000 + NAME_ROW*40 + 8)
+    sta temp4+1
+    lda #3
+    sta colour
+    ldx #0
+    ldy #0
+    lda #23
+    jsr txt_show
+    lda #NAME_ROW
+    sta t_row
+    rts
+
+; The pause letter (ROUT1.asm's pause: paustxt, a P printed at &7FE8 while the game is paused, printed again to take it
+; away): BBC byte 77 of row 31 = pixel 154, the bottom row, cells 38-39, cyan. It shares cell 38 with the end of the sound
+; letter, so taking it away redraws that.
+pause_str: .byte 25,$FF
+toggle_pause_letter:
+    lda game_paused
+    beq tpl_off
+    lda #<pause_str
+    sta temp2
+    lda #>pause_str
+    sta temp2+1
+    lda #<($6000 + 24*320 + 38*8)
+    sta temp3
+    lda #>($6000 + 24*320 + 38*8)
+    sta temp3+1
+    lda #<($4000 + 24*40 + 38)
+    sta temp4
+    lda #>($4000 + 24*40 + 38)
+    sta temp4+1
+    lda #3
+    sta colour
+    jmp print_bitmap_line_off2
+tpl_off:
+    lda #0
+    ldx #15
+tpl_clr:
+    sta $6000 + 24*320 + 38*8,x
+    dex
+    bpl tpl_clr
+    lda #$73
+    sta $4000 + 24*40 + 38
+    sta $4000 + 24*40 + 39
+    jmp draw_sound_indicator
 
 ; check_escape_key: RUN/STOP, the original's ESCAPE: in a game it gives up (loses every ship, as ROUT4.asm's
 ; escape does); in the demo it goes back to the title. Returns with the Z flag set if held, same convention as
@@ -701,8 +1163,7 @@ cc_4:
     cmp #9
     bcs cc_rts
     inc score_digits+3
-    lda score_digits+3
-    sta score_glyphs
+    jsr score_rebuild
     jsr redraw_score
 cc_rts:
     rts
@@ -811,45 +1272,44 @@ pause_key_prev:
 ; address of cell (bullet_row[X], bullet_col[X]) - bitmap only, bullets
 ; need no screen-matrix/color-RAM address (see above).
 compute_bullet_addr:
-    lda #0
-    sta temp3
-    sta temp3+1
     lda bullet_row,x
-    beq cba_row_done
-    sta length              ; length = loop counter (documented scratch,
-                             ; free here - see file header)
-cba_row_loop:
-    lda temp3
-    clc
-    adc #40
+    ldy bullet_col,x
+    jmp cell_addr
+
+; cell_addr: A = cell row, Y = cell column -> temp3 = bitmap address of that cell ($6000 + row*320 + col*8), by table
+; (the row*40 sum it replaces was a loop of up to 24 additions for every bullet drawn or erased). Clobbers A, Y, length.
+cell_addr:
+    sty length
+    tay
+    lda cell_row_lo,y
     sta temp3
-    lda temp3+1
-    adc #0
+    lda cell_row_hi,y
     sta temp3+1
-    dec length
-    bne cba_row_loop
-cba_row_done:
+    ldy length
     lda temp3
     clc
-    adc bullet_col,x
+    adc cell_col_lo,y
     sta temp3
     lda temp3+1
-    adc #0
-    sta temp3+1              ; temp3 = row*40 + col (cell index)
-    asl temp3
-    rol temp3+1
-    asl temp3
-    rol temp3+1
-    asl temp3
-    rol temp3+1              ; temp3 = cell index * 8
-    lda temp3
-    clc
-    adc #<$6000
-    sta temp3
-    lda temp3+1
-    adc #>$6000
+    adc cell_col_hi,y
     sta temp3+1
     rts
+cell_row_lo:
+ .repeat 32, r
+ .byte <($6000 + r * 320)
+ .endrepeat
+cell_row_hi:
+ .repeat 32, r
+ .byte >($6000 + r * 320)
+ .endrepeat
+cell_col_lo:
+ .repeat 40, c
+ .byte <(c * 8)
+ .endrepeat
+cell_col_hi:
+ .repeat 40, c
+ .byte >(c * 8)
+ .endrepeat
 
 ; draw_bullet_x: X = bullet slot index. XOR-plots bullet_bitmap at that
 ; slot's current cell - also serves as its own erase (calling it twice
@@ -857,14 +1317,38 @@ cba_row_done:
 ; Preserves X.
 draw_bullet_x:
     jsr compute_bullet_addr
-    ldy #0
-dbx_loop:
-    lda bullet_bitmap,y
+    ldy #0                   ; (unrolled: the shape is bullet_bitmap)
+    lda #$30
     eor (temp3),y
     sta (temp3),y
     iny
-    cpy #8
-    bne dbx_loop
+    lda #$30
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$30
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$30
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$30
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$30
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$FC
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$20
+    eor (temp3),y
+    sta (temp3),y
     rts
 
 ; fire_bullet_if_requested: BOMBS1.asm's process_my_bombs, the fire half. Holding RETURN auto-repeats: while it is
@@ -1111,58 +1595,47 @@ rab_rts:
 ; shared routine without self-modifying code, same tradeoff already
 ; noted for draw_score_bar/draw_body_text's table loops.
 compute_alien_bullet_addr:
-    lda #0
-    sta temp3
-    sta temp3+1
     lda alien_bullet_row,x
-    beq caba_row_done
-    sta length
-caba_row_loop:
-    lda temp3
-    clc
-    adc #40
-    sta temp3
-    lda temp3+1
-    adc #0
-    sta temp3+1
-    dec length
-    bne caba_row_loop
-caba_row_done:
-    lda temp3
-    clc
-    adc alien_bullet_col,x
-    sta temp3
-    lda temp3+1
-    adc #0
-    sta temp3+1
-    asl temp3
-    rol temp3+1
-    asl temp3
-    rol temp3+1
-    asl temp3
-    rol temp3+1
-    lda temp3
-    clc
-    adc #<$6000
-    sta temp3
-    lda temp3+1
-    adc #>$6000
-    sta temp3+1
-    rts
+    ldy alien_bullet_col,x
+    jmp cell_addr
 
 ; draw_alien_bullet_x: X = alien-bullet slot index. XOR-plots the
 ; placeholder shape at that slot's current cell - also its own erase,
 ; same as draw_bullet_x. Preserves X.
 draw_alien_bullet_x:
     jsr compute_alien_bullet_addr
-    ldy #0
-dabx_loop:
-    lda alien_bullet_bitmap,y
+    ldy #0                   ; (unrolled: the shape is alien_bullet_bitmap)
+    lda #$40
     eor (temp3),y
     sta (temp3),y
     iny
-    cpy #8
-    bne dabx_loop
+    lda #$50
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$20
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$20
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$20
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$20
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$40
+    eor (temp3),y
+    sta (temp3),y
+    iny
+    lda #$50
+    eor (temp3),y
+    sta (temp3),y
     rts
 
 ; move_alien_bullets: mirrors move_bullets, downward - advances every
@@ -1400,7 +1873,6 @@ MAXPATT = 4                ; real CONST.asm value - concurrent spawn-group
                             ; entries at once" (see try_load_next_group's
                             ; header) - just large enough for one entry's
                             ; sub-records (patt45 needs 3, the largest).
-ALIEN_MAX_X = 149          ; safe right-edge wrap margin - see wrap_x_margin
 
 ; wave_pool_size: real WAVE.asm's own per-wave first EQUB byte (pool
 ; size), waves 0-15 in order - matches wave_group_list's own indexing
@@ -1504,100 +1976,53 @@ aet_finish:
     dec alien_live_count
     rts
 
-; alien_spawn_table: ALL 46 real spawn groups (PATT.asm's patt0-patt45),
-; flattened to 54 rows (6 groups have 2 sub-records, patt45 has 3 - see
-; PATT.asm's own EQUB1/EQUB2/EQUB3 sub-record counts). 8 columns, from
-; ALIENS1.asm's own record-reading code (the real field order: x, y,
-; delay, count, relx, rely, gra, pnum - traced from ALIENS1.asm:71-88,
-; not guessed from the data's spacing, which is what led to relx/rely
-; being dropped entirely the first time this was decoded):
-;   col, row, type, delay, count, pattern, relx, rely
-; col/row: spawn position. x converted BBC-byte-columns -> C64 cells (1
-; BBC byte = 2 BBC pixels = half a C64 cell, so col = BBC x/2, clamped
-; to 37 so a 3-cell-wide alien's right edge can't go off the 40-column
-; screen - same edge clamp draw_ship/the lives icons use - this is a
-; real width match, BBC MODE 2 is 160 pixels wide and so is our screen,
-; so no scaling is needed on this axis, just the same footprint margin
-; used everywhere else). row is the REAL, unscaled BBC row (y/8, 0-31 -
-; the BBC screen is 256 scanlines/32 rows tall, a real 7-row/56-scanline
-; difference from our 200-scanline/25-row screen, confirmed via
-; ROUT1.asm's line_start/line_starth). This used to be clamped into
-; [4,21] here at data-authoring time - a design decision made and never
-; checked. Real Y is unbounded on the BBC (ALIENS3.asm never bounds-
-; checks it), so real spawns like patt4/6/7/23/24/25/26's y=231/255 are
-; genuine, valid BBC positions, not overflow - clamping them distorted
-; the source data. Scaling the real row onto our shorter screen instead
-; of clamping it happens at RUNTIME now, in y_to_row (see its own
-; header, near alien_refresh_display) - this table keeps the real,
-; unscaled row so the master data stays exactly what PATT.asm says.
-; type: (gra-12)/2 - the real ALIENS2.asm indexing formula (traced from
-; its "SEC:SBC#12:LSRA" - see the collision/death bookkeeping comment
-; below), giving all 12 real alien types now, not the old 3-type
-; simplification.
+; sp_x ... sp_rely: ALL 46 real spawn groups (PATT.asm's patt0-patt45), flattened to 54 rows (6 groups have 2 sub-records,
+; patt45 has 3 - see PATT.asm's own EQUB1/EQUB2/EQUB3 sub-record counts), every field exactly as PATT.asm has it (generated
+; from it and compared with it by a script, 2026-11-19; an earlier version had x and y cut to cells, which moved a start by up
+; to 3 pixels across and 7 lines down, and turned the "random x" starts 78 and 79 into 74):
+;   x, y, type, delay, count, pattern, relx, rely
+; One array per column (sp_x, sp_y, ...), each 54 long and indexed by the row number: a table of rows of 8 bytes needed
+; row*8 as an offset, which does not fit a byte past row 31, so groups 28-45 (patt28 on: rows 32-53) read the wrong rows.
+; x: the BBC's byte column 0-79 (2 pixels each, so the alien's x in colour pixels is 2 * x); 78 and 79 are not positions but "start
+;    somewhere random" (see pas_spawn). y: the BBC scanline 0-255.
+; type: (gra-12)/2 - the real ALIENS2.asm indexing formula (traced from its "SEC:SBC#12:LSRA" - see the collision/death
+;    bookkeeping comment below), giving all 12 real alien types.
 ; delay/count: initdel/initnum as-is (spawn cadence, total spawns).
-; pattern: initpnum as-is - bit7 = reflect (see alien_select_pattern),
-; bits0-6 = which patdat block (0-29, pattern_table below).
-; relx/rely: initrelx/initrely, PRE-SCALED into the same raw units as
-; alien_x/alien_y (relx*2, rely*1 - same x2/y1 factors as
-; addrelx_tab/addrely_tab, see their own header). After EVERY individual
-; spawn from a group, ALIENS2.asm's proc5 (real source) walks that
-; group's OWN spawn point by relx/rely before the next alien in the
-; group spawns - see alien_spawn_cur_x/y and pas_spawn.
-alien_spawn_table:
- .byte   0,  6,  0,  5, 20,  0,  0,  5   ; row  0 = patt0
- .byte  36,  6,  0,  5, 20,128,  0,  5   ; row  1 = patt1
- .byte   6,  3,  3,  4, 30,  1,  0,  0   ; row  2 = patt2
- .byte  31,  3,  3,  4, 30,129,  0,  0   ; row  3 = patt3
- .byte   0, 31,  4, 20,  2,  2, 16,232   ; row  4 = patt4
- .byte  37, 31,  4, 20,  2,130,240,232   ; row  5 = patt4
- .byte   3,  5,  6, 50,  4,  4,  0, 16   ; row  6 = patt5
- .byte   0, 28,  6,  8, 10,  5,  0,  0   ; row  7 = patt6
- .byte   3, 28,  4,  8, 10,  5,  0,  0   ; row  8 = patt6
- .byte  36, 28,  6,  8, 10,133,  0,  0   ; row  9 = patt7
- .byte  33, 28,  4,  8, 10,133,  0,  0   ; row 10 = patt7
- .byte  18,  4,  4,  6, 15,  6,  0,  0   ; row 11 = patt8
- .byte  19,  4,  4,  6, 15,134,  0,  0   ; row 12 = patt9
- .byte   0,  4,  2,  5,  8,  7,  0,  0   ; row 13 = patt10
- .byte  36,  4,  2,  5,  8,135,  0,  0   ; row 14 = patt11
- .byte  16,  4,  9,  6, 12,  8,  0,  0   ; row 15 = patt12
- .byte  20,  4,  9,  6, 12,136,  0,  0   ; row 16 = patt12
- .byte   0, 16,  0,  6, 16,  9,  0,  0   ; row 17 = patt13
- .byte  37, 16,  0,  6, 16,137,  0,  0   ; row 18 = patt14
- .byte   0, 26,  3,  5, 12, 10,  0,  0   ; row 19 = patt15
- .byte  37, 26,  3,  5, 12,138,  0,  0   ; row 20 = patt16
- .byte   0,  4,  1,  7, 12, 11,  0,  0   ; row 21 = patt17
- .byte  37,  4,  1,  7, 12,139,  0,  0   ; row 22 = patt18
- .byte  24,  4,  2,  5, 10, 13,  0,  0   ; row 23 = patt19
- .byte  13,  4,  2,  5, 10,141,  0,  0   ; row 24 = patt20
- .byte   0,  4,  4,  5,  8, 14,  0,  0   ; row 25 = patt21
- .byte  37,  4,  4,  5,  8,142,  0,  0   ; row 26 = patt22
- .byte   1, 31,  4,  3, 20, 15,  0,  0   ; row 27 = patt23
- .byte  36, 31,  4,  3, 20,143,  0,  0   ; row 28 = patt24
- .byte   3, 31,  2,  3, 16, 16,  0,  0   ; row 29 = patt25
- .byte  34, 31,  2,  3, 16,144,  0,  0   ; row 30 = patt26
- .byte   0,  4,  3,  4, 14, 17,  0,  0   ; row 31 = patt27
- .byte  37,  4,  3,  4, 14,145,  0,  0   ; row 32 = patt28
- .byte   0,  4,  4,  2, 21, 18,  6,  0   ; row 33 = patt29
- .byte  37,  4,  4,  2, 21,146,250,  0   ; row 34 = patt30
- .byte  36,  4, 10,  4, 12, 19,  0,  0   ; row 35 = patt31
- .byte   0,  4, 10,  4, 12,147,  0,  0   ; row 36 = patt32
- .byte  37,  4,  3,  8, 20, 20,  0,  0   ; row 37 = patt33
- .byte  37,  4,  3,  8, 20,148,  0,  0   ; row 38 = patt34
- .byte  37,  4, 11,  4, 14, 21,  0,  0   ; row 39 = patt35
- .byte   0,  4, 11,  4, 14,149,  0,  0   ; row 40 = patt36
- .byte   1,  4,  2,  4, 18, 22,  0,  0   ; row 41 = patt37
- .byte  36,  4,  2,  4, 18,150,  0,  0   ; row 42 = patt38
- .byte  37,  4,  4,  5, 12, 23,  0,  0   ; row 43 = patt39
- .byte  37,  4,  4,  5, 12,151,  0,  0   ; row 44 = patt40
- .byte   0,  4,  0,  4, 19, 24,  4,  0   ; row 45 = patt41
- .byte  37,  4,  0,  4, 19,152,252,  0   ; row 46 = patt42
- .byte  37,  4,  2, 16, 20, 25,  0,  0   ; row 47 = patt43
- .byte  37,  4,  2, 14, 20,153,  0,  0   ; row 48 = patt43
- .byte  37,  4,  3,  8, 20, 26,  0,  0   ; row 49 = patt44
- .byte  37,  4,  3,  8, 20,154,  0,  0   ; row 50 = patt44
- .byte   0,  5,  5,  1,  1, 29,  0,  0   ; row 51 = patt45
- .byte   0,  9,  7,  4, 16, 27,  0,  0   ; row 52 = patt45
- .byte   0, 12,  8,  4, 15, 28,  0,  0   ; row 53 = patt45
+; pattern: initpnum as-is - bit7 = reflect (see alien_select_pattern), bits0-6 = which patdat block (0-29, pattern_table below).
+; relx/rely: initrelx/initrely as-is (a byte; 232 is -24). After EVERY individual spawn from a group, ALIENS2.asm's proc5 walks
+;    that group's OWN spawn point by (relx,rely) before the next alien in the group spawns - see alien_spawn_cur_x/y and pas_spawn.
+sp_x:
+ .byte 0,73,12,62,0,74,6,0,7,73,66,36,38,0,73,33,41,0
+ .byte 74,0,74,0,74,48,27,0,74,2,72,6,69,0,74,0,74,73
+ .byte 1,78,79,74,0,2,72,78,79,0,74,78,79,78,79,0,0,0
+sp_y:
+ .byte 50,50,24,24,255,255,40,231,231,231,231,32,32,32,32,32,32,130
+ .byte 130,210,210,32,32,32,32,32,32,255,255,255,255,32,32,32,32,32
+ .byte 32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,40,72,96
+sp_type:
+ .byte 0,0,3,3,4,4,6,6,4,6,4,4,4,2,2,9,9,0
+ .byte 0,3,3,1,1,2,2,4,4,4,4,2,2,3,3,4,4,10
+ .byte 10,3,3,11,11,2,2,4,4,0,0,2,2,3,3,5,7,8
+sp_delay:
+ .byte 5,5,4,4,20,20,50,8,8,8,8,6,6,5,5,6,6,6
+ .byte 6,5,5,7,7,5,5,5,5,3,3,3,3,4,4,2,2,4
+ .byte 4,8,8,4,4,4,4,5,5,4,4,16,14,8,8,1,4,4
+sp_count:
+ .byte 20,20,30,30,2,2,4,10,10,10,10,15,15,8,8,12,12,16
+ .byte 16,12,12,12,12,10,10,8,8,20,20,16,16,14,14,21,21,12
+ .byte 12,20,20,14,14,18,18,12,12,19,19,20,20,20,20,1,16,15
+sp_pattern:
+ .byte 0,128,1,129,2,130,4,5,5,133,133,6,134,7,135,8,136,9
+ .byte 137,10,138,11,139,13,141,14,142,15,143,16,144,17,145,18,146,19
+ .byte 147,20,148,21,149,22,150,23,151,24,152,25,153,26,154,29,27,28
+sp_relx:
+ .byte 0,0,0,0,8,248,0,0,0,0,0,0,0,0,0,0,0,0
+ .byte 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,253,0
+ .byte 0,0,0,0,0,0,0,0,0,2,254,0,0,0,0,0,0,0
+sp_rely:
+ .byte 5,5,0,0,232,232,16,0,0,0,0,0,0,0,0,0,0,0
+ .byte 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ .byte 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 
 ; patt_group_row_start/row_count: patt-group-number (0-45, WAVE.asm's
 ; own numbering) -> which row(s) of alien_spawn_table above it expands
@@ -1812,20 +2237,14 @@ tlng_slot_found:
     clc
     adc iaw_row
     sta alien_spawn_row,x
-    jsr iaw_row_to_offset      ; temp1 = row*8
-    ldy temp1
-    lda alien_spawn_table+3,y
+    tay                        ; Y = the row
+    lda sp_delay,y
     sta alien_spawn_delay_left,x
-    lda alien_spawn_table+4,y
+    lda sp_count,y
     sta alien_spawn_count_left,x
-    lda alien_spawn_table+0,y
-    asl a
-    asl a
+    lda sp_x,y                   ; the group's walking spawn point: the BBC's initx (a byte column) and inity
     sta alien_spawn_cur_x,x
-    lda alien_spawn_table+1,y
-    asl a
-    asl a
-    asl a
+    lda sp_y,y
     sta alien_spawn_cur_y,x
     lda #1
     sta pat_st,x
@@ -1838,10 +2257,7 @@ tlng_wave_done:
 tlng_done:
     rts
 
-iaw_row_to_offset:               ; A = master row index -> temp1 = A*8
-    asl a
-    asl a
-    asl a
+iaw_row_to_offset:               ; A = master row index -> temp1 (kept as it was named: the row itself now, see sp_x)
     sta temp1
     rts
 
@@ -1854,6 +2270,8 @@ iaw_row_to_offset:               ; A = master row index -> temp1 = A*8
 ; X:BNEproc5 / LDA#0:STAinitst,X:DECinitact") - this is what lets
 ; try_load_next_group's gate eventually open again.
 pas_slot:
+ .byte 0
+pas_xs:
  .byte 0
 
 process_alien_spawns:
@@ -1879,9 +2297,9 @@ pas_has_count:
 pas_delay_done:
 
     lda alien_spawn_row,y           ; this active slot's master row
-    jsr iaw_row_to_offset           ; temp1 = row*8
+    jsr iaw_row_to_offset           ; temp1 = row
     ldx temp1
-    lda alien_spawn_table+3,x
+    lda sp_delay,x
     sta alien_spawn_delay_left,y
     lda alien_spawn_count_left,y   ; DEC has no absolute,Y mode
     sec
@@ -1907,24 +2325,40 @@ pas_spawn:
     inc alien_live_count
 
     ldy pas_slot
-    lda alien_spawn_cur_x,y   ; this group's CURRENT walking spawn point,
-    sta alien_x,x              ; not the table's static base - already raw
-    lsr a                      ; color-pixels, so no more *4 here (see
-    lsr a                      ; alien_spawn_cur_x's own header)
+    lda alien_spawn_cur_x,y   ; this group's CURRENT walking spawn point (a byte column, 0-79)
+    ; ALIENS2.asm's proc4: "JSRrand:AND#31 / CPX#78:BEQalter_start_x / CPX#79:BNEuse_original_x / ADC#40": a group at 78 starts
+    ; anywhere in columns 0-31, one at 79 in columns 41-72 (the carry the two compares leave set makes it +41)
+    cmp #78
+    bcc pas_x_plain
+    sta pas_xs
+    jsr rand                   ; (touches only A)
+    and #31
+    ldy pas_xs
+    cpy #79
+    bcc pas_x_set              ; 78: columns 0-31
+    clc
+    adc #41                    ; 79: columns 41-72
+pas_x_set:
+    ldy pas_slot
+pas_x_plain:
+    asl a                      ; byte column -> colour pixels (2 each)
+    sta alien_x,x
+    lsr a
+    lsr a
     sta alien_disp_col,x        ; rendered cell = raw x / 4
     lda alien_spawn_cur_y,y
     sta alien_y,x
     jsr y_to_row
     sta alien_disp_row,x        ; rendered cell = scaled real row
 
-    ldy temp1                  ; back to the table's group*8 offset for
-    lda alien_spawn_table+2,y  ; the fields that don't walk (type/pattern)
+    ldy temp1                  ; back to the table's row for
+    lda sp_type,y              ; the fields that don't walk (type/pattern)
     sta alien_type,x
     jsr init_alien_hp
     lda #0
     sta alien_mult,x         ; forces an immediate pattern-read on this
                               ; alien's first tick, not a move first
-    lda alien_spawn_table+5,y
+    lda sp_pattern,y
     jsr alien_select_pattern
 
     ; Walk this group's own spawn point by (relx,rely) for the NEXT
@@ -1934,13 +2368,18 @@ pas_spawn:
     ; table offset is still valid there. length is free scratch (no jsr
     ; between this and its use).
     ldy temp1
-    lda alien_spawn_table+7,y   ; rely
+    lda sp_rely,y               ; rely
     sta length
-    lda alien_spawn_table+6,y   ; relx
+    lda sp_relx,y               ; relx (a byte; the add drops its carry, as proc5's does)
     ldy pas_slot
     clc
     adc alien_spawn_cur_x,y
-    jsr wrap_x_margin
+pas_wrap80:
+    cmp #80                     ; chk_xinit_wrap
+    bcc pas_wrapped
+    sbc #80
+    jmp pas_wrap80
+pas_wrapped:
     sta alien_spawn_cur_x,y
     lda alien_spawn_cur_y,y
     clc
@@ -1988,7 +2427,9 @@ anw_no_tune:
     inc level_ones
     jsr draw_level_flags
     jsr init_alien_wave
-    rts
+    lda #0
+    sta sixteen_flag             ; ALIENS1.asm: "LDA#0:STAsixteen_flag" after the flags
+    jmp show_zone_message        ; ALIENS1.asm's init_snd: "ENTERING ZONE n"
 
 ; --- Alien flight patterns: a real interpreter for ALIENS3.asm/
 ; ALIENS4.asm's pattern bytecode (an earlier pass used simple placeholder
@@ -2367,12 +2808,10 @@ aei_mve:
 
 ; alien_spawn_child: X = parent alien slot (preserved), A = child's
 ; pattern selector byte. Finds a free pool slot and spawns a child
-; there: parent's type, a position 8 scanlines below the parent
+; there: a random type (0 or 1), a position 8 scanlines below the parent
 ; (matches ALIENS4.asm's "LDAaly,X:ADC#8"), the given pattern, and a
 ; fresh alien_hp/alien_score via init_alien_hp - same as any other
-; spawn. Simplified only in that it skips the source's own graphic-
-; randomization step (DAT_NEWALIEN isn't reached by any of wave 0's 4
-; real patterns, so this has never actually been exercised in play).
+; spawn. The child's type is random 0 or 1, as in the source (not the parent's).
 asc_pattern:
  .byte 0
 asc_parent:
@@ -2395,9 +2834,11 @@ asc_spawn:
     sta alien_active,x
     inc alien_live_count
     ldy asc_parent
-    lda alien_type,y
+    jsr rand                  ; dat_newal3: "JSRrand:AND#2 / ADC#12 / STAalgra,Y": the child is graphic 12 or 14 at random,
+    and #2                    ; whatever its parent is (types 0 and 1: the first two of the alien shapes)
+    lsr a
     sta alien_type,x
-    jsr init_alien_hp
+    jsr init_alien_hp         ; (and its hits, from alien_hits for that type, as the original's "LDAalien_hits,X:STAalcount,Y")
     lda alien_x,y
     sta alien_x,x
     lda alien_disp_col,y
@@ -2467,22 +2908,20 @@ ard_redraw:
 ard_done:
     rts
 
-; wrap_x_margin: A = a walking/live alien x position that may have grown
-; past ALIEN_MAX_X (149) - the same safe right-edge margin
-; SHIP_MAX_COL/the lives icons already use, not the real BBC's literal
-; screen edge (160). Wraps by repeated subtraction, exactly mirroring
-; ALIENS3.asm's check_x_wrap/ALIENS2.asm's chk_xinit_wrap loops (real
-; BBC wraps at 80 BBC-byte-columns = our 160 raw units; wrapping at the
-; full 160 here would let a 12px-wide alien's footprint poke past
-; column 39 into the next row's flat screen-matrix/bitmap memory - the
-; exact class of corruption alien_apply_move's Y floor below already
-; had to fix once). Returns the wrapped value in A.
+; wrap_x_margin: A = an alien's x (colour pixels) after a step, as the 8-bit sum. ALIENS3.asm's check_x_wrap ("CMP#80:BCC / SBC#80",
+; repeated) on the BBC's byte columns, which are 2 pixels each, so here: below 160 is as it is; 160-223 is a step off the right
+; edge and comes round at 160 less; 224 and up is a step off the left edge (the 8-bit sum came out as 256 - something), which the BBC's
+; own wrap brings to 16 columns (32 pixels) past where it would be (x = 0, one column left: 255 -> 175 -> 95 -> 15). The step is at
+; most 6 columns, so the two ranges cannot meet. Returns the wrapped value in A.
 wrap_x_margin:
-    cmp #ALIEN_MAX_X
+    cmp #160
     bcc wxm_done
-    sec
-    sbc #ALIEN_MAX_X
-    jmp wrap_x_margin
+    cmp #224
+    bcs wxm_left
+    sbc #160-1                  ; (carry is clear after the compare: SBC subtracts one more)
+    rts
+wxm_left:
+    sbc #224                    ; carry set
 wxm_done:
     rts
 
@@ -2881,6 +3320,8 @@ sc_cab_next:
     cpx #ALIEN_BULLET_COUNT
     bne sc_clear_abullets
 
+    jsr hide_zone_message        ; (after the bullets: they skip the message's row while it is up)
+
     lda lives_out
     bne sc_no_icon
     jsr redraw_lives_after_loss
@@ -2948,9 +3389,21 @@ she_go:
     jsr ship_home_row
     sta ship_row
     jsr draw_ship
-    jsr init_alien_wave
+    lda wave_off                 ; INIT.asm's next_life: the pool is cleared and set to the wave's size, and "DECwavoff" makes
+    pha                          ; the group that was in progress the next one to load, so the wave goes on from there, not
+    jsr init_alien_wave          ; from its first group
+    pla
+    beq she_replay_none
+    sec
+    sbc #1
+    sta wave_off
+she_replay_none:
+    lda #0                       ; rstall: the alien round-robin starts again from slot 0, the fire delay is clear
+    sta alien_procst
+    sta fire_delay
     lda #GS_PLAYING
     sta game_state
+    jsr show_zone_message        ; first_life again
     lda lives_count              ; INIT.asm's next_life: the last spare ship has just been used
     bne she_rts
     lda #SFX_LSTMAN
@@ -2962,6 +3415,7 @@ she_over:
     bne she_over_no_tune
     lda #MUS_OVER
     jsr music_start
+    jsr show_game_over
 she_over_no_tune:
     lda #GS_GAME_OVER
     sta game_state
@@ -4004,16 +4458,16 @@ dtt_saved_x:
 ; original score_bar_table's tighter spacing (that had only a 1-char
 ; placeholder where the real 5-char field now goes).
 score_digits:
- .byte 0,0,0,0
+ .byte 0,0,0,0,0,0         ; tens, hundreds, thousands, ten-thousands, hundred-thousands, millions
 score_glyphs:
- .byte 0,0,0,0,0,$FF       ; "00000" initially - kept in sync with
-                             ; score_digits by add_score, not .res'd zero
-                             ; (glyph code = digit value directly; blank/
-                             ; space is a separate code, 38, unused here)
+ .byte 38,38,38,38,38,38,0,$FF   ; the 7 digits of the score field, as glyph codes: millions down to the units, which is always a 0.
+                             ; Leading zeros are blanks (38), not "0": the original draws a digit only when it
+                             ; changes, so the field starts as a single 0 and 260 points reads "260" (checked on
+                             ; the original running headless). Kept in sync with score_digits by score_rebuild.
 
-SCORE_VALUE_COL = 12
+SCORE_VALUE_COL = 9           ; the original's 7-digit field: pixels 36-77, so a score is right-aligned as it was
 HI_COL          = 21
-HISCORE_COL     = 29
+HISCORE_COL     = 26          ; the 7-digit high score, ending where the 5-digit one did
 
 ; --- Real high-score table (src/HIGH.asm) ---
 ; hs_score_digits: 8 rows x 4 bytes, same tens/hundreds/thousands/ten-
@@ -4028,15 +4482,15 @@ HISCORE_COL     = 29
 ; fill is space (38), NOT .res's default zero - glyph code 0 is the
 ; digit "0" (see score_glyphs' own comment above), so a zero-filled
 ; name would show as "0000000000", not blank.
-hs_score_digits:                 ; DOWN.asm highval: 30000 25000 20000 15000 10000 5000 3000 1000
- .byte 0,0,0,3
- .byte 0,0,5,2
- .byte 0,0,0,2
- .byte 0,0,5,1
- .byte 0,0,0,1
- .byte 0,0,5,0
- .byte 0,0,3,0
- .byte 0,0,1,0
+hs_score_digits:                 ; DOWN.asm highval: 30000 25000 20000 15000 10000 5000 3000 1000 (6 digits a row, tens first)
+ .byte 0,0,0,3,0,0
+ .byte 0,0,5,2,0,0
+ .byte 0,0,0,2,0,0
+ .byte 0,0,5,1,0,0
+ .byte 0,0,0,1,0,0
+ .byte 0,0,5,0,0,0
+ .byte 0,0,3,0,0,0
+ .byte 0,0,1,0,0,0
 hs_names:                        ; DOWN.asm highname: "SUPERIOR  " on every row
  .repeat 8
  .byte 28,30,25,14,27,18,24,27,38,38
@@ -4047,44 +4501,69 @@ hs_names:                        ; DOWN.asm highname: "SUPERIOR  " on every row
 ; rebuilds score_glyphs and redraws just that fixed-position/fixed-width
 ; field - no erase needed, unlike a moving object.
 add_score:
+    ldx #0
+as_loop:
     clc
-    adc score_digits
+    adc score_digits,x
     cmp #10
-    bcc as_store0
-    sbc #10
-    sta score_digits
-    inc score_digits+1
-    lda score_digits+1
-    cmp #10
-    bcc as_rebuild
-    lda #0
-    sta score_digits+1
-    inc score_digits+2
-    lda score_digits+2
-    cmp #10
-    bcc as_rebuild
-    lda #0
-    sta score_digits+2
-    inc score_digits+3
-    lda score_digits+3
-    cmp #10
-    bcc as_rebuild
-    lda #9
-    sta score_digits+3
-    jmp as_rebuild
-as_store0:
-    sta score_digits
-as_rebuild:
-    lda score_digits+3
-    sta score_glyphs
-    lda score_digits+2
-    sta score_glyphs+1
-    lda score_digits+1
-    sta score_glyphs+2
-    lda score_digits
-    sta score_glyphs+3
+    bcc as_store
+    sbc #10                    ; (carry is set)
+    sta score_digits,x
+    lda #1                     ; carry into the next digit
+    inx
+    cpx #6
+    bne as_loop
+    jsr reset_score            ; add_to_score's "DEX:BPLaddscr2 / JMPreset_score_to_0": past the millions the score starts over
+    jmp redraw_score
+as_store:
+    sta score_digits,x
+    jsr score_rebuild
     jmp redraw_score
 
+; reset_score: the score is 0 (a new game): digits and field.
+reset_score:
+    lda #0
+    ldx #5
+rs_zero:
+    sta score_digits,x
+    dex
+    bpl rs_zero
+    ; falls into score_rebuild
+
+; score_rebuild: score_glyphs from score_digits - millions first, leading zeros blank, the units always a 0.
+score_rebuild:
+    ldx #5
+    ldy #0
+    lda #0
+    sta sr_seen
+sr_loop:
+    lda score_digits,x
+    bne sr_show
+    lda sr_seen
+    bne sr_zero
+    lda #38
+    bne sr_put
+sr_zero:
+    lda #0
+    beq sr_put
+sr_show:
+    pha
+    lda #1
+    sta sr_seen
+    pla
+sr_put:
+    sta score_glyphs,y
+    iny
+    dex
+    bpl sr_loop
+    lda #0
+    sta score_glyphs,y         ; the units
+    rts
+sr_seen:
+ .byte 0
+
+; redraw_score: the score field after every change, at the same fixed cells every time.
+; (what follows is the original comment on why the cells are cleared first)
 ; redraw_score: called by add_score every time the score changes, at the
 ; same fixed cells every time. print_bitmap_line only ever ORAs new
 ; glyph bits into the bitmap - correct for text drawn once, but wrong
@@ -4103,7 +4582,7 @@ rs_clear:
     lda #0
     sta $6000+SCORE_VALUE_COL*8,y
     iny
-    cpy #64
+    cpy #88                  ; the 7-glyph field: 11 cells
     bne rs_clear
 
     lda #<score_glyphs
@@ -4123,14 +4602,31 @@ rs_clear:
     jmp print_bitmap_line
 
 draw_score_bar:
-    lda hs_score_digits+3        ; HI shows the top of the high-score table
-    sta str_hiscore
-    lda hs_score_digits+2
-    sta str_hiscore+1
-    lda hs_score_digits+1
-    sta str_hiscore+2
-    lda hs_score_digits
-    sta str_hiscore+3
+    ldx #5                       ; HI shows the top of the high-score table (poke_hi_scr: leading zeros not drawn)
+    ldy #0
+    sty sr_seen
+dsb_hi:
+    lda hs_score_digits,x
+    bne dsb_hi_show
+    lda sr_seen
+    bne dsb_hi_zero
+    lda #38
+    bne dsb_hi_put
+dsb_hi_zero:
+    lda #0
+    beq dsb_hi_put
+dsb_hi_show:
+    pha
+    lda #1
+    sta sr_seen
+    pla
+dsb_hi_put:
+    sta str_hiscore,y
+    iny
+    dex
+    bpl dsb_hi
+    lda #0
+    sta str_hiscore,y            ; the units
     ldx #0
 dsb_loop:
     lda score_bar_table,x
@@ -4229,7 +4725,7 @@ HS_TITLE_ROW = 3
 HS_TITLE_COL = 12
 HS_ROW0      = 6
 HS_ROW_STRIDE = 2
-HS_COL       = 8
+HS_COL       = 4           ; the original's row starts at pixel 16 and is 21 glyphs wide
 
 ; hs_row_bitmap_lo/hi, hs_row_matrix_lo/hi: precomputed per-row
 ; destination addresses (8 entries, row X's screen row = HS_ROW0 +
@@ -4252,11 +4748,10 @@ hs_row_matrix_hi:
  .byte >($4000+(HS_ROW0+I*HS_ROW_STRIDE)*40+HS_COL)
 .endrepeat
 
-; hs_row_buf: one row's built glyph-code string - rank digit(1), space,
-; 4 score digits, trailing fixed units digit, space, 10 name glyphs,
-; $FF terminator (18 glyphs + terminator, matching hs_build_row below).
+; hs_row_buf: one row's built glyph-code string, as HIGH.asm's zt lays it out - rank digit(1), space, the 7 digits of the
+; score (leading zeros blank, the units a 0), two spaces, 10 name glyphs, $FF terminator (21 glyphs + terminator).
 hs_row_buf:
- .res 19
+ .res 22
 
 ; hs_seen_nonzero: scratch for hs_build_row's leading-zero-as-space
 ; suppression (real HIGH.asm's ah2/ph2/ph3) - reset per row, not
@@ -4300,43 +4795,39 @@ hs_build_row:
     sta hbr_row
     clc
     adc #1
-    sta hs_row_buf                ; rank digit 1-8 - row is always 0-7,
-                                    ; so this never needs its own
-                                    ; suppression check
+    sta hs_row_buf                ; rank digit 1-8
     lda #38
     sta hs_row_buf+1               ; space
 
-    lda hbr_row
+    lda hbr_row                    ; row * 6 = the row's first digit in hs_score_digits
     asl a
+    sta hbr_base
     asl a
-    sta hbr_base                   ; row*4 - hs_score_digits row base
+    clc
+    adc hbr_base
+    clc
+    adc #5                         ; its most significant digit (the millions)
+    sta hbr_base
 
     lda #0
     sta hs_seen_nonzero
+    ldx #0
+hbr_dig:
+    ldy hbr_base
+    lda hs_score_digits,y
+    jsr hbr_emit_digit
+    sta hs_row_buf+2,x
+    dec hbr_base
+    inx
+    cpx #6
+    bne hbr_dig
 
-    ldy hbr_base
-    lda hs_score_digits+3,y
-    jsr hbr_emit_digit
-    sta hs_row_buf+2
-    ldy hbr_base
-    lda hs_score_digits+2,y
-    jsr hbr_emit_digit
-    sta hs_row_buf+3
-    ldy hbr_base
-    lda hs_score_digits+1,y
-    jsr hbr_emit_digit
-    sta hs_row_buf+4
-    ldy hbr_base
-    lda hs_score_digits+0,y
-    jsr hbr_emit_digit
-    sta hs_row_buf+5
-
-    lda #0                          ; trailing fixed units digit - same
-    jsr hbr_emit_digit                ; suppression as the real digits
-    sta hs_row_buf+6
-
+    lda #0                          ; the units digit, through the same leading-zero rule (HIGH.asm's ph2/ph3), so an
+    jsr hbr_emit_digit              ; empty row is blank
+    sta hs_row_buf+8
     lda #38
-    sta hs_row_buf+7                ; space before the name
+    sta hs_row_buf+9                ; two spaces before the name
+    sta hs_row_buf+10
 
     lda hbr_row
     jsr hs_name_row_offset
@@ -4344,14 +4835,14 @@ hs_build_row:
     ldx #0
 hbr_name_loop:
     lda hs_names,y
-    sta hs_row_buf+8,x
+    sta hs_row_buf+11,x
     iny
     inx
     cpx #10
     bne hbr_name_loop
 
     lda #$FF
-    sta hs_row_buf+18
+    sta hs_row_buf+21
     rts
 
 ; hs_name_row_offset: A = row (0-7) in, returns A = row*10 (byte offset
@@ -4389,8 +4880,7 @@ hs_draw_row:
 hdr_clear_loop:
     sta (temp3),y
     iny
-    cpy #216
-    bne hdr_clear_loop
+    bne hdr_clear_loop           ; 256 bytes: the row's 32 cells
 
     ldx hdr_saved_x
     txa
@@ -4447,6 +4937,8 @@ dhs_loop:
 ; hs_cmp_result: scratch for hs_compare_row.
 hs_cmp_result:
  .byte 0
+hcr_tmp:
+ .byte 0
 
 ; hs_compare_row: Y = row (0-7) in, preserved on exit. Sets
 ; hs_cmp_result=1 if the live score_digits is STRICTLY greater than
@@ -4455,8 +4947,11 @@ hs_cmp_result:
 hs_compare_row:
     tya
     pha
+    asl a                        ; row * 6
+    sta hcr_tmp
     asl a
-    asl a
+    clc
+    adc hcr_tmp
     clc
     adc #<hs_score_digits
     sta temp2
@@ -4465,7 +4960,7 @@ hs_compare_row:
     sta temp2+1
     lda #0
     sta hs_cmp_result
-    ldy #3
+    ldy #5
 hcr_loop:
     lda score_digits,y
     cmp (temp2),y
@@ -4509,6 +5004,20 @@ hti_copy_count:
 ; blanks its name, and runs name entry there. If the score doesn't beat
 ; any row, does nothing - matches ahigh only running gnam/pht on an
 ; actual insertion.
+; hs_qualifies: A <> 0 (and Z clear) if the score just made would go into the table.
+hs_qualifies:
+    ldy #0
+hq_loop:
+    jsr hs_compare_row
+    lda hs_cmp_result
+    bne hq_yes
+    iny
+    cpy #8
+    bne hq_loop
+    lda #0
+hq_yes:
+    rts
+
 hs_try_insert:
     lda demo_flag
     bne hti_none
@@ -4532,14 +5041,17 @@ hti_shift_loop:
     cpx hti_insert_row           ; the loop ran forever (and trashed memory): a hang on the first high score
     bcc hti_shift_done
 
-    txa                          ; 4-byte score row: src=X*4, dst=src+4
-    asl a
+    txa                          ; 6-byte score row: src=X*6, dst=src+6
     asl a
     sta hti_src_off
+    asl a
     clc
-    adc #4
+    adc hti_src_off
+    sta hti_src_off
+    clc
+    adc #6
     sta hti_dst_off
-    lda #4
+    lda #6
     sta hti_copy_count
 hti_ss_loop:
     ldy hti_src_off
@@ -4575,19 +5087,19 @@ hti_sn_loop:
 hti_shift_done:
     lda hti_insert_row
     asl a
+    sta hti_src_off
     asl a
+    clc
+    adc hti_src_off
     tay
-    lda score_digits+0
+    ldx #0
+hti_put:
+    lda score_digits,x
     sta hs_score_digits,y
     iny
-    lda score_digits+1
-    sta hs_score_digits,y
-    iny
-    lda score_digits+2
-    sta hs_score_digits,y
-    iny
-    lda score_digits+3
-    sta hs_score_digits,y
+    inx
+    cpx #6
+    bne hti_put
 
     lda hti_insert_row
     jsr hs_name_row_offset
@@ -4616,19 +5128,20 @@ hsk_col_mask:
 ; key_glyph_table: standard C64 keyboard matrix position (col*8+row) ->
 ; real glyph code (digit=value, letter=10+0-indexed position, space=38
 ; - the scheme from the font-code fix), or a sentinel: $FD=DEL/INST
-; (backspace), $FE=RETURN (finish), $FF=anything else (ignored). Matrix
+; (backspace), $FE=RETURN (finish), $FC=a key the name does not take (the bell),
+; $FF=SHIFT, CTRL, C= and RUN/STOP (no character on the BBC either: ignored). Matrix
 ; layout cross-checked against this file's own existing key checks:
 ; col0/row1=RETURN (check_return_key), col7/row4=SPACE (check_start_key),
 ; col5/row1=P (check_pause_key) all agree with the table below.
 key_glyph_table:
- .byte $FD,$FE,$FF,$FF,$FF,$FF,$FF,$FF   ; col0: DEL,RETURN,CRSR_R,F7,F1,F3,F5,CRSR_D
+ .byte $FD,$FE,$FC,$FC,$FC,$FC,$FC,$FC   ; col0: DEL,RETURN,CRSR_R,F7,F1,F3,F5,CRSR_D
  .byte 3,32,10,4,35,28,14,$FF             ; col1: 3,W,A,4,Z,S,E,SHIFT
  .byte 5,27,13,6,12,15,29,33              ; col2: 5,R,D,6,C,F,T,X
  .byte 7,34,16,8,11,17,30,31              ; col3: 7,Y,G,8,B,H,U,V
  .byte 9,18,19,0,22,20,24,23              ; col4: 9,I,J,0,M,K,O,N
- .byte $FF,25,21,$FF,$FF,$FF,$FF,$FF      ; col5: +,P,L,-,.,:,@,,
- .byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF    ; col6: POUND,*,;,HOME,SHIFT,=,UP,/
- .byte 1,$FF,$FF,2,38,$FF,26,$FF          ; col7: 1,LEFT,CTRL,2,SPACE,C=,Q,RUNSTOP
+ .byte $FC,25,21,$FC,$FC,$FC,$FC,$FC      ; col5: +,P,L,-,.,:,@,,
+ .byte $FC,$FC,$FC,$FC,$FF,$FC,$FC,$FC    ; col6: POUND,*,;,HOME,SHIFT,=,UP,/
+ .byte 1,$FC,$FF,2,38,$FF,26,$FF          ; col7: 1,LEFT,CTRL,2,SPACE,C=,Q,RUNSTOP
 
 hs_last_key:
  .byte $FF
@@ -4709,16 +5222,19 @@ hs_store_name_char:
 ; hs_enter_name: real HIGH.asm's gnam. X = row (0-7) to fill (already
 ; blanked to spaces by hs_try_insert). Live letter-by-letter entry -
 ; A-Z/0-9/space accepted up to 10 characters, DEL steps back and blanks
-; the erased slot, RETURN finishes (only once at least 1 character has
-; been typed, matching gnam's own "LDXwavbase:...CPY#10:BEQgn3" - an
-; empty name can't be submitted). Redraws just this one row
+; the erased slot, RETURN finishes (gnam: "CMP#&D:BEQgn2" comes first, so an empty name, all spaces, is accepted).
+; The bell (gn3: "LDA#7:JSROSWRCH") sounds for any other key, a letter typed
+; when the 10 are used, and DEL with nothing to delete. Redraws just this one row
 ; (hs_draw_row) after each accepted change, not the whole table.
 hs_enter_name:
     stx hs_enter_row
+    jsr show_name_prompt
     lda #0
     sta hs_name_cursor
     lda #$FF
     sta hs_last_key
+    jsr hs_scan_key              ; a key still held from the game (RETURN is the fire key) is not a new press: gnam
+                                 ; flushes the keyboard buffer first ("LDA#21:LDX#0:JSRosbyte")
 
 hen_loop:
     jsr movestars
@@ -4734,10 +5250,12 @@ hen_wait_raster:
     beq hen_finish_check
     cmp #$FD
     beq hen_backspace
+    cmp #$FC
+    beq hen_beep
 
     ldy hs_name_cursor
     cpy #10
-    bcs hen_loop
+    bcs hen_beep
     jsr hs_store_name_char
     inc hs_name_cursor
     ldx hs_enter_row
@@ -4745,13 +5263,18 @@ hen_wait_raster:
     jmp hen_loop
 
 hen_finish_check:
-    lda hs_name_cursor
-    beq hen_loop
+    ldx #0
+    jsr txt_hide                 ; the prompt goes
     rts
+
+hen_beep:
+    lda #SFX_BELL
+    jsr sfx_play
+    jmp hen_loop
 
 hen_backspace:
     lda hs_name_cursor
-    beq hen_loop
+    beq hen_beep
     dec hs_name_cursor
     lda #38
     jsr hs_store_name_char
@@ -4841,6 +5364,11 @@ flag5_bottom_right:
 ; each letter only ever sets new bits (background is 0), never clears
 ; the other's. temp1 tracks the alternating state (0/1) across the
 ; whole string, reset to 0 (offset 0) at the start of each call.
+; print_bitmap_line_off2: the same, but the first letter starts 2 pixels into its cell (for a BBC byte column that is odd).
+print_bitmap_line_off2:
+    lda #1
+    sta temp1
+    jmp pbl_char
 print_bitmap_line:
     lda #0
     sta temp1            ; 0 = next letter at offset 0, 1 = offset 2
@@ -5181,7 +5709,7 @@ str_scr:
 str_hi:
     .byte 17,18,$FF                                 ; HI (CHARP.asm HItext)
 str_hiscore:
-    .byte 3,0,0,0,0,$FF                             ; the top high score, set by draw_score_bar (30000 at power-on)
+    .byte 38,38,3,0,0,0,0,$FF                             ; the top high score, set by draw_score_bar (30000 at power-on)
 str_bykevin:
     .byte 11,34,38,20,14,31,18,23,38,14,13,32,10,27,13,28,$FF   ; BY KEVIN EDWARDS (CHARP.asm myname)
 str_press:

@@ -39,7 +39,7 @@ SPR_MAXRAW    = 36           ; objects per frame (the swarm waves have 32 aliens
 SPR_BUF       = SPR_MAXRAW   ; size of one of the two list buffers
 SPR_TOP_LINE  = 30
 SPR_MUSIC_LINE = 8           ; the music engine's interrupt: after the last sprite of a frame, before the next top
-SPR_HC        = 3            ; lines one handler run is assumed to take
+SPR_HC        = 3            ; lines one handler run is assumed to take (5 was tried: no fewer ghosts, and the swarm's aliens were pushed 20-40 lines down)
 SPR_DONE      = 17           ; first line after a sprite's 16 lines of data
 SPR_DMA_END   = 22           ; first line a sprite's Y may match again (its DMA runs 21 lines)
 SPR_YOFF      = 50           ; sprite Y of the first screen line
@@ -55,10 +55,10 @@ sz_bcount:     .res 1
 sz_back_ready: .res 1
 sz_bbase:      .res 1
 sz_phase:      .res 1
+sz_vcount:     .res 1        ; frames, counted by the interrupt at line 8 (the game loop times its passes with it)
 sz_sp:         .res 1        ; sprite to program next
 sz_tk:         .res 1        ; rank of the next object to program
 sz_ncount:     .res 1
-sz_rn:         .res 1
 sz_oc:         .res 1
 sz_oi:         .res 1
 sz_key:        .res 1
@@ -70,6 +70,8 @@ sz_tsh:        .res 1
 sz_tt:         .res 1
 sz_tmp2:       .res 1
 sz_pu:         .res 1
+sz_wy:         .res 1        ; index in the back buffer of the next object
+sz_alt:        .res 1        ; spr_build_frame: 1 = skip this call
 
 .segment "SPRVAR"
 sz_ship_on: .res 1           ; $80 while the ship sprite is shown, else 0
@@ -87,13 +89,22 @@ sr_xlo:    .res SPR_MAXRAW
 sr_xhi:    .res SPR_MAXRAW
 sr_ptr:    .res SPR_MAXRAW
 sr_col:    .res SPR_MAXRAW
-s_idx:     .res SPR_MAXRAW
+s_idx:     .res SPR_MAXRAW      ; slots in Y order, kept from frame to frame
+s_vld:     .res SPR_MAXRAW      ; per slot: 1 = can be shown this frame, 2 = and already in the list
 
 .segment "SPRITES"
 .incbin "src-c64/gen/shapes.bin"
 
 .segment "CODE"
 
+spr_xlo_tab:
+.repeat 256, I
+    .byte <(24 + 2*I)
+.endrepeat
+spr_xhi_tab:
+.repeat 256, I
+    .byte >(24 + 2*I)
+.endrepeat
 spr_enmask: .byte 0,1,3,7,15,31,63,127,255
 spr_bitm:   .byte 1,2,4,8,16,32,64,128
 spr_bitn:   .byte $FE,$FD,$FB,$F7,$EF,$DF,$BF,$7F
@@ -193,15 +204,39 @@ spr_ship_hide:
     sta sz_ship_on
     rts
 
+; spr_build_frame: what the game loop calls once a frame. With many aliens on screen (SPR_HEAVY or more, as the last list had) a
+; list costs a good part of a frame, and a game loop pass that runs even a little over waits for the next frame, so passes came out one,
+; two and three frames long at random and the aliens skipped ahead. Then the list is built on every other call: the sprites
+; move at a steady half rate, the ship, its shots and the rest of the game still run every frame.
+SPR_HEAVY = 8
+spr_build_frame:
+    lda sz_ncount
+    cmp #SPR_HEAVY
+    bcc sbf_build
+    lda sz_alt
+    eor #1
+    sta sz_alt
+    bne sbf_skip
+sbf_build:
+    jmp spr_build
+sbf_skip:
+    rts
+
 ; spr_build: once a frame. Preserves nothing.
+; Pass 1 turns every alien that can be shown into an object kept at its own pool slot (sr_*[slot], s_vld[slot] = 1).
+; The order of the objects by Y is kept from frame to frame in s_idx (a list of slots): the aliens move a little
+; each frame, so last frame's order is nearly right and only needs its dead entries dropped, the new aliens added
+; and an insertion sort that has next to nothing to do. (Sorting from scratch each frame took up to 29000 cycles
+; in the swarm waves, two frames.)
 spr_build:
     lda #0
     sta sz_back_ready       ; the buffer being written is no longer ready: a swap now must keep the front one
-    sta sz_rn
-    ldx #0
+    tax
 sb_loop:
     cpx alien_pool_max
     bcs sb_sort
+    lda #0
+    sta s_vld,x
     lda alien_active,x
     beq sb_next
     ldy alien_y,x
@@ -226,168 +261,156 @@ sb_alive:
     lda alien_type,x
 sb_shape:
     sta sz_tsh
-    ldy sz_rn
-    cpy #SPR_MAXRAW
-    bcs sb_next
     lda sz_ty
-    sta sr_y,y
-    lda alien_x,x
-    asl                     ; x2: colour pixels -> hardware pixels (9 bits)
-    sta sz_ty
-    lda #0
-    rol
-    sta sz_th
-    lda sz_ty
-    clc
-    adc #24                 ; the left edge of the 320-pixel screen
-    sta sr_xlo,y
-    lda sz_th
-    adc #0
-    sta sr_xhi,y
+    sta sr_y,x
+    ldy alien_x,x            ; hardware X = 24 + 2 * x (colour pixels -> hardware pixels, 9 bits; 24 = the screen's left edge)
+    lda spr_xlo_tab,y
+    sta sr_xlo,x
+    lda spr_xhi_tab,y
+    sta sr_xhi,x
     lda sz_tsh
     clc
     adc #$10                ; sprite pointer: shapes start at $4400
-    sta sr_ptr,y
+    sta sr_ptr,x
     ldy sz_tsh
     lda spr_own_col,y
-    ldy sz_rn
-    sta sr_col,y
-    inc sz_rn
+    sta sr_col,x
+    lda #1
+    sta s_vld,x
 sb_next:
     inx
     jmp sb_loop
 sb_sort:
-    lda sz_rn
+    ; last frame's order: keep the slots that can still be shown (marked 2), in place
+    ldy #0                  ; read position
+    sty sz_oc               ; write position = objects kept
+sb_cmp:
+    cpy sz_ncount           ; (still last frame's count)
+    bcs sb_cdone
+    ldx s_idx,y
+    iny
+    cpx alien_pool_max      ; a slot the wave no longer has
+    bcs sb_cmp
+    lda s_vld,x
+    beq sb_cmp
+    lda #2
+    sta s_vld,x
+    txa
+    ldx sz_oc
+    sta s_idx,x
+    inc sz_oc
+    jmp sb_cmp
+sb_cdone:
+    ; aliens that were not in the list (new, or back in range): at the end
+    ldx #0
+sb_app:
+    cpx alien_pool_max
+    bcs sb_adone
+    lda s_vld,x
+    cmp #1
+    bne sb_anext
+    txa
+    ldy sz_oc
+    sta s_idx,y
+    inc sz_oc
+sb_anext:
+    inx
+    jmp sb_app
+sb_adone:
+    lda sz_oc
     sta sz_ncount
 
-    ; s_idx = 0..n-1, then insertion sort by sr_y
-    ldx #0
-:   cpx sz_ncount
-    bcs sb_sinit
-    txa
-    sta s_idx,x
-    inx
-    bne :-
-sb_sinit:
+    ; insertion sort by sr_y; an element already in place costs one comparison; equal Y keeps its order
     lda #1
     sta sz_oi
 sb_so:
-    lda sz_oi
-    cmp sz_ncount
+    ldx sz_oi
+    cpx sz_ncount
     bcs sb_sdone
-    tax
-    lda s_idx,x
-    sta sz_key
-    tax
-    lda sr_y,x
+    ldy s_idx,x
+    lda sr_y,y
     sta sz_keyy
-    ldy sz_oi
-sb_si:
-    cpy #0
-    beq sb_place
-    ldx s_idx-1,y
-    lda sr_y,x
-    cmp sz_keyy
-    bcc sb_place
-    beq sb_place
-    txa
-    sta s_idx,y
-    dey
-    jmp sb_si
-sb_place:
+    sty sz_key
+    ldy s_idx-1,x
+    cmp sr_y,y
+    bcs sb_inplace          ; not before the one ahead of it
+sb_shift:
+    lda s_idx-1,x           ; move the greater one up, X = the hole
+    sta s_idx,x
+    dex
+    beq sb_put
+    ldy s_idx-1,x
+    lda sz_keyy
+    cmp sr_y,y
+    bcc sb_shift
+sb_put:
     lda sz_key
-    sta s_idx,y
+    sta s_idx,x
+sb_inplace:
     inc sz_oi
     jmp sb_so
 sb_sdone:
 
-    ; final Y (moved down where the sprite or the handler would not be ready), in rank order, into the back buffer
+    ; final Y (moved down where the sprite or the handler would not be ready), in rank order, into the back buffer.
+    ; An object is never earlier than the one before it (that keeps the IRQ chain in order). From the 8th object on it re-uses the
+    ; sprite of the one SPR_N before it, so it may not start before that sprite's DMA is over (its Y + SPR_DMA_END; its data is
+    ; done SPR_DONE after, which this includes) and not before the previous handler has finished: its line + SPR_HC (it runs)
+    ; + SPR_HC + 1 (and a line to spare). Anything that would start below SPR_YMAX is dropped.
     lda sz_front
     eor #SPR_BUF
     sta sz_bbase
+    sta sz_wy               ; where the next object goes in the buffer
     lda #0
-    sta sz_oc
-    tay                     ; Y = input rank
+    sta sz_oc               ; objects placed
+    sta sz_oi               ; input rank
 sb_fl:
-    cpy sz_ncount
-    bcc :+
-    jmp sb_filled
-:   sty sz_oi
-    ldx s_idx,y
-    stx sz_rw
-    lda sr_y,x
-    sta sz_ty
-    lda sz_oc
-    beq sb_fs1              ; first object: nothing before it
-    clc
-    adc sz_bbase
-    tax
-    lda so_ysp-1,x          ; never earlier than the object before (keeps the IRQ chain in order)
-    cmp sz_ty
-    bcc sb_fs1
-    beq sb_fs1
-    sta sz_ty
+    ldx sz_oi
+    cpx sz_ncount
+    bcs sb_filled
+    inc sz_oi
+    ldy s_idx,x
+    sty sz_rw               ; the alien's slot
+    lda sr_y,y              ; its own Y
+    ldy sz_wy
+    ldx sz_oc
+    beq sb_fs2              ; the first object: nothing before it
+    cmp so_ysp-1,y
+    bcs sb_fs1
+    lda so_ysp-1,y          ; not earlier than the object before
 sb_fs1:
-    lda sz_oc
-    cmp #SPR_N
-    bcc sb_fs2              ; the first 8 objects have a sprite to themselves (programmed at the top of the frame)
+    cpx #SPR_N
+    bcc sb_fs2
+    sta sz_ty
+    lda so_ysp-SPR_N,y      ; Y of the object that used this sprite last
     clc
-    adc sz_bbase
-    sec
-    sbc #SPR_N
-    sta sz_pu               ; the object that used this sprite last
-    tax
-    lda so_ysp,x
-    clc
-    adc #SPR_DONE           ; its data is finished here: the earliest the sprite may be re-programmed
-    sta sz_tt
-    lda sz_oc
-    clc
-    adc sz_bbase
-    tax
-    lda so_irq-1,x          ; and not before the previous handler has finished
-    clc
-    adc #SPR_HC
-    cmp sz_tt
-    bcc :+
-    sta sz_tt
-:   lda sz_tt
-    clc
-    adc #SPR_HC+1           ; earliest Y: this handler done, plus a line
+    adc #SPR_DMA_END
     bcs sb_fdrop
     sta sz_tmp2
-    ldx sz_pu
-    lda so_ysp,x
+    lda so_irq-1,y          ; the line of the previous handler
     clc
-    adc #SPR_DMA_END        ; and not while the sprite's DMA is still running
+    adc #SPR_HC*2+1
     bcs sb_fdrop
     cmp sz_tmp2
-    bcc :+
-    sta sz_tmp2
-:   lda sz_tmp2
+    bcs sb_fs3
+    lda sz_tmp2
+sb_fs3:
     cmp sz_ty
-    bcc sb_fs2
-    beq sb_fs2
-    sta sz_ty               ; moved down to fit
+    bcs sb_fs2
+    lda sz_ty               ; (the earliest line is not later than where it is: it stays)
 sb_fs2:
-    lda sz_ty
     cmp #SPR_YMAX+1
     bcs sb_fdrop
-    lda sz_bbase
-    clc
-    adc sz_oc
-    tay
-    ldx sz_rw
-    lda sz_ty
     sta so_ysp,y
-    lda sz_oc
-    cmp #SPR_N
-    lda #0
-    bcc :+
+    sta sz_ty
+    cpx #SPR_N              ; the first 8 objects are programmed at the top of the frame (no handler); the others by their own
+    lda #0                  ; handler, SPR_HC + 1 lines before their Y
+    bcc sb_fs4
     lda sz_ty
     sec
     sbc #SPR_HC+1
-:   sta so_irq,y
+sb_fs4:
+    sta so_irq,y
+    ldx sz_rw
     lda sr_xlo,x
     sta so_x,y
     lda sr_xhi,x
@@ -397,9 +420,8 @@ sb_fs2:
     lda sr_col,x
     sta so_col,y
     inc sz_oc
+    inc sz_wy
 sb_fdrop:
-    ldy sz_oi
-    iny
     jmp sb_fl
 sb_filled:
     lda sz_oc
@@ -413,10 +435,12 @@ spr_irq:
     cld
     lda #1
     sta $D019
+    TMIRQ 7                 ; (timing build) yellow: the interrupt that sets up the frame, or the music
     lda sz_phase
     beq si_top
     cmp #2
     bne si_chainj
+    inc sz_vcount
     jsr music_frame         ; phase 2: the music, once a frame
     lda #0
     sta sz_phase
@@ -496,6 +520,7 @@ si_more:
     jmp si_out
 
 si_chain:
+    TMIRQ 5                 ; green: a sprite of the chain
 si_cl:
     lda sz_tk
     clc
@@ -529,6 +554,7 @@ si_cdone:
     lda #SPR_MUSIC_LINE
     sta $D012
 si_out:
+    TMBACK
     pla
     tay
     pla

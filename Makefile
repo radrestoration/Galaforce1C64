@@ -18,7 +18,7 @@ B    := build
 PRG  := $(B)/GalaForce1-c64.PRG
 SRCS := Master-c64.mak.asm $(wildcard src-c64/*.asm src-c64/*.inc src-c64/gen/*) object/O.SPFONT_C64
 
-.PHONY: all run help clean intro run-intro test-intro zip trace sprtest test-sprtest run-sprtest test-game test-music sprdata musicdata d64 test-build run-test
+.PHONY: timing-build run-timing all run help clean intro run-intro test-intro zip trace sprtest test-sprtest run-sprtest test-game test-music sprdata musicdata d64 test-build run-test
 all: $(PRG)
 
 help:
@@ -34,6 +34,7 @@ help:
 	@echo "make run-sprtest  build the sprite test and run it in VICE (x64sc); run-sprtest MODEL=ntsc for NTSC"
 	@echo "make d64    build/galaforce1.d64: the loading screens (first file: LOAD\"*\",8,1) and the game on a disk image"
 	@echo "make intro  build/intro.prg: the loading screens alone, made from disc/Disc025-Galaforce.ssd (run-intro runs the d64 in VICE, test-intro checks it headless)"
+	@echo "make timing-build  build/GalaForce1-c64-TIMING.PRG: the border shows what the CPU is doing (black waiting, red sprite list, blue rest of the pass, yellow/green interrupts); run-timing runs it"
 	@echo "make test-build  build/GalaForce1-c64-TEST.PRG with cheat keys: 1 next wave, 2 extra ship, 3 invulnerable, 4 +10000 (run-test runs it)"
 	@echo "make zip    build/Galaforce1-C64.zip: the release (galaforce1.d64, the game PRG without loading screens, README.md)"
 	@echo "make clean  remove build/"
@@ -47,6 +48,17 @@ TESTPRG := $(B)/GalaForce1-c64-TEST.PRG
 test-build: $(TESTPRG)
 $(TESTPRG): $(SRCS) galaforce1-c64.cfg | $(B)
 	$(CL65) --asm-define CHEAT=1 -m $(B)/map-TEST.txt -t c64 -C galaforce1-c64.cfg -Ln $(B)/GalaForce1-c64-TEST.lbl -o $@ -l $(B)/GalaForce1-c64-TEST.list Master-c64.mak.asm
+# a build that colours the border by what the CPU is doing (see TMCOL in c64.inc), for looking at the timing on a real machine:
+# black = waiting for the next frame, red = the sprite list, blue = the rest of a pass, yellow/green = the sprite interrupts.
+# The stripes down the sides of the screen show how much of the frame each takes; blue or red running on past the end of the frame
+# means that pass is taking more than a frame.
+TIMINGPRG := $(B)/GalaForce1-c64-TIMING.PRG
+timing-build: $(TIMINGPRG)
+$(TIMINGPRG): $(SRCS) galaforce1-c64.cfg | $(B)
+	$(CL65) --asm-define TIMING=1 -m $(B)/map-TIMING.txt -t c64 -C galaforce1-c64.cfg -Ln $(B)/GalaForce1-c64-TIMING.lbl -o $@ Master-c64.mak.asm
+run-timing: $(TIMINGPRG)
+	$(X64SC) $(if $(MODEL),-model $(MODEL)) -autostartprgmode 1 -VICIIfilter 0 $(TIMINGPRG)
+
 run-test: $(TESTPRG)
 	$(X64SC) $(if $(MODEL),-model $(MODEL)) -autostartprgmode 1 -VICIIfilter 0 $(TESTPRG)
 

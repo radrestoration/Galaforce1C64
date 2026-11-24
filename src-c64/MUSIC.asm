@@ -33,6 +33,7 @@ m_inst:    .res 6            ; instrument (offset into mus_inst)
 m_wave:    .res 6            ; waveform of the note sounding, with its gate bit
 m_speed:   .res 4            ; ticks per duration class
 m_acc:     .res 1
+m_clock:   .res 1            ; counts the 50 Hz ticks (the pause key stops it, as it stops the music); the zone message times itself with it
 m_pal:     .res 1
 m_vol:     .res 1
 m_note:    .res 1
@@ -138,6 +139,7 @@ mf_vol_ok:
     sta m_acc
     bcc mf_rts              ; no tick this frame (1 in 6)
 mf_tick:
+    inc m_clock
     ldx #4
 mf_loop:
     jsr music_chan

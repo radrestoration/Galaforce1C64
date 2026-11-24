@@ -138,6 +138,9 @@ FX = [
     ("CRASH", 0x81, 0x0000, 0x0C, 0x08, [(44, 1600, 90)]),                # the ship: a longer, deeper noise
     ("XLIFE", 0x41, 0x0800, 0x08, 0xA6, warble(785, 4, 7, 75)),            # extra life: ENVELOPE 3's slow warble, 1.5 s
     ("LSTMAN", 0x41, 0x0800, 0x08, 0xA6, warble(1230, 7, 3, 126)),         # last ship: ENVELOPE 9's quick, wide warble, 2.5 s
+    # the BBC's bell (VDU 7: HIGH.asm's gn3, a wrong key in name entry): the OS defaults, channel 3, square wave, treble C =
+    # 523.013 Hz, 0.3 s (6 x 1/20 s); amplitude 144 = -13 of -15, so near full volume with no envelope
+    ("BELL", 0x41, 0x0800, 0x00, 0xD1, [(15, 523.013, 523.013)]),
 ]
 FX_NOISE_NOTE = "noise 'frequency' is the SID's own, it only sets how coarse the hiss is"
 
